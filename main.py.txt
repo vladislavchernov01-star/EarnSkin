@@ -2,7 +2,7 @@ import logging
 from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
 
-BOT_TOKEN = "8891544206:AAGWWSCOGPG0zb9mei9GoHFo2kuy9dQ9GJU"
+BOT_TOKEN = "8891544206:AAGHEi8azq08GcnzRZIooO9QcEXTy-0Mftg"
 ADMIN_ID = 498339398
 MASTER_KEY = "super_secret_key_1234567890123"
 
