@@ -1,0 +1,47 @@
+import logging
+from telegram import Update
+from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
+
+BOT_TOKEN = "8891544206:AAGWWSCOGPG0zb9mei9GoHFo2kuy9dQ9GJU"
+ADMIN_ID = 498339398
+MASTER_KEY = "super_secret_key_1234567890123"
+
+logging.basicConfig(
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    level=logging.INFO
+)
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user = update.effective_user
+    await update.message.reply_html(
+        f"Привет, {user.mention_html()}! 👋\n\n"
+        "Это EarnSkin — бот для анализа и торговли скинами.\n"
+        "Нажми /tutorial, чтобы пройти быстрый туториал."
+    )
+
+async def tutorial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📘 Туториал EarnSkin:\n\n"
+        "1. /setcookie — вставь cookie Steam (нужен steamLoginSecure)\n"
+        "2. /price AK-47 | Redline (Field-Tested) — анализ цены и ROI\n"
+        "3. /admin — панель статистики (только для админа)\n"
+        "4. /referral — реферальная ссылка для друзей\n"
+        "5. /health — статус системы и нагрузка"
+    )
+
+async def admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if update.effective_user.id != ADMIN_ID:
+        await update.message.reply_text("❌ Доступ запрещён. Это админ-команда.")
+        return
+    await update.message.reply_text(
+        "🛠 Панель администратора EarnSkin\n\n"
+        "Здесь будут: статистика, логи, список пользователей, бэкапы."
+    )
+
+if __name__ == '__main__':
+    application = ApplicationBuilder().token(BOT_TOKEN).build()
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("tutorial", tutorial))
+    application.add_handler(CommandHandler("admin", admin))
+    print("EarnSkin bot started...")
+    application.run_polling()
