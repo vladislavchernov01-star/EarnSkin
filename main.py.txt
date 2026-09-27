@@ -29,7 +29,7 @@ import aiohttp
 # КОНФИГУРАЦИЯ
 # ============================================================
 
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "TOKEN_HERE")
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "8891544206:AAGHEi8azq08GcnzRZIooO9QcEXTy-0Mftg")
 USD_RUB_FALLBACK = 92.0
 EUR_RUB_FALLBACK = 100.0
 STEAM_COMMISSION = 0.15
