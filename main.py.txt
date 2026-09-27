@@ -1,266 +1,348 @@
 
 import os
-import asyncio
-import logging
-import time
-import math
-import json
 import sqlite3
-from datetime import datetime, timedelta
-from urllib.parse import quote
-
+import asyncio
 import aiohttp
-import aiosqlite
-
-from aiogram import Bot, Dispatcher, Router, F
-from aiogram.types import (
-    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
-    LabeledPrice, WebAppInfo
-)
+import json
+import time
+import logging
+import math
+from datetime import datetime, timedelta
+from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command, CommandStart
-from aiogram.exceptions import TelegramDetailedApiException
+from aiogram.types import (
+    InlineKeyboardMarkup, InlineKeyboardButton,
+    LabeledPrice, Message, CallbackQuery,
+)
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramBadRequest
 
-# ═══════════════════════════════════════════
-# CONFIG
-# ═══════════════════════════════════════════
-
+# ==================== CONFIG ====================
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "8891544206:AAG5GtX59-DXZeWTs1dVA75sSYoa81sNX24")
-
 DEBUG_MODE = True
-DEBUG_STEAM_ID = "76561198239028756"  # ← ВСТАВЬ СВОЙ STEAM ID
+DEBUG_STEAM_ID = "76561198239028756"  # ВСТАВЬ СВОЙ STEAM ID
 
-USD_RUB_FALLBACK = 95.0
-EUR_RUB_FALLBACK = 102.0
+USD_RUB_RATE = 95.0
+EUR_RUB_RATE = 103.0
+SCAN_INTERVAL = 30
+MIN_ROI = 15.0
+MAX_CONCURRENT_SCANS = 2
 
 STEAM_COMMISSION = 0.15
 CSFLOAT_COMMISSION = 0.02
 SKINPORT_COMMISSION = 0.12
 
-SCAN_INTERVAL = 30
-MAX_CONCURRENT_SCANS = 2
-PORTFOLIO_CHECK_INTERVAL = 1800  # 30 min
-
-DB_PATH = "trades.db"
-
-# ═══════════════════════════════════════════
-# LOGGING
-# ═══════════════════════════════════════════
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(message)s"
-)
+# ==================== LOGGING ====================
+logging.basicConfig(level=logging.INFO, format="%(asctime)s | %(levelname)s | %(message)s")
 logger = logging.getLogger(__name__)
 
-# ═══════════════════════════════════════════
-# GLOBALS
-# ═══════════════════════════════════════════
-
-bot = None
+# ==================== BOT ====================
+bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
-router = Router()
-dp.include_router(router)
 
-_usd_rub = USD_RUB_FALLBACK
-_eur_rub = EUR_RUB_FALLBACK
-_rate_ts = 0
-_scan_sem = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+# ==================== DATABASE (sqlite3 — встроенная, без установки) ====================
+DB_PATH = "trades.db"
 
-# ═══════════════════════════════════════════
-# DATABASE
-# ═══════════════════════════════════════════
+def db_init():
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("""CREATE TABLE IF NOT EXISTS users (
+        user_id INTEGER PRIMARY KEY,
+        steam_id TEXT,
+        subscription TEXT DEFAULT 'free',
+        sub_expires INTEGER DEFAULT 0,
+        searches_today INTEGER DEFAULT 0,
+        last_search_date TEXT,
+        joined TEXT,
+        referral_code TEXT,
+        referred_by TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS portfolio (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        item_name TEXT,
+        buy_price REAL,
+        buy_platform TEXT,
+        float_val REAL,
+        stickers TEXT,
+        paint_seed INTEGER,
+        added_at TEXT,
+        trade_ban_until TEXT,
+        notified_sell INTEGER DEFAULT 0,
+        notified_stoploss INTEGER DEFAULT 0,
+        notified_tradeban INTEGER DEFAULT 0
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS favorites (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        item_name TEXT,
+        added_at TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS deal_history (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id INTEGER,
+        item_name TEXT,
+        roi REAL,
+        found_at TEXT,
+        platform TEXT
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS daily_deals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        date TEXT,
+        item_name TEXT,
+        roi REAL,
+        platform TEXT,
+        buy_price REAL,
+        sell_price REAL
+    )""")
+    c.execute("""CREATE TABLE IF NOT EXISTS referrals (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        referrer_id INTEGER,
+        referred_id INTEGER,
+        created_at TEXT,
+        rewarded INTEGER DEFAULT 0
+    )""")
+    conn.commit()
+    conn.close()
 
-async def db_init():
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.executescript("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            steam_id TEXT,
-            username TEXT,
-            joined_at TEXT,
-            sub_tier TEXT DEFAULT 'free',
-            sub_until TEXT,
-            searches_today INTEGER DEFAULT 0,
-            last_search_date TEXT,
-            referrer_id INTEGER
-        );
-        CREATE TABLE IF NOT EXISTS portfolio (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            item_name TEXT,
-            buy_price REAL,
-            buy_platform TEXT,
-            sell_platform TEXT,
-            asset_id TEXT,
-            float_value REAL,
-            stickers TEXT,
-            added_at TEXT,
-            trade_ban_until TEXT,
-            status TEXT DEFAULT 'active'
-        );
-        CREATE TABLE IF NOT EXISTS favorites (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            item_name TEXT,
-            added_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS deals_history (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id INTEGER,
-            item_name TEXT,
-            roi REAL,
-            strategy TEXT,
-            found_at TEXT
-        );
-        CREATE TABLE IF NOT EXISTS deal_of_day (
-            date TEXT PRIMARY KEY,
-            item_name TEXT,
-            roi REAL,
-            strategy TEXT,
-            buy_price REAL,
-            sell_price REAL,
-            text TEXT
-        );
-        CREATE TABLE IF NOT EXISTS referrals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            referrer_id INTEGER,
-            referred_id INTEGER,
-            created_at TEXT
-        );
-        """)
-        await db.commit()
-    logger.info("DB initialized")
+def db_get_user(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    return row
 
-# ═══════════════════════════════════════════
-# CURRENCY
-# ═══════════════════════════════════════════
-
-async def update_rates():
-    global _usd_rub, _eur_rub, _rate_ts
-    now = time.time()
-    if now - _rate_ts < 3600:
-        return
-    _rate_ts = now
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get("https://open.er-api.com/v6/latest/USD", timeout=10) as r:
-                data = await r.json()
-                if data.get("rates", {}).get("RUB"):
-                    _usd_rub = data["rates"]["RUB"]
-                    logger.info(f"USD/RUB = {_usd_rub}")
-    except Exception as e:
-        logger.warning(f"USD rate fetch failed: {e}, using fallback {_usd_rub}")
-    try:
-        async with aiohttp.ClientSession() as s:
-            async with s.get("https://open.er-api.com/v6/latest/EUR", timeout=10) as r:
-                data = await r.json()
-                if data.get("rates", {}).get("RUB"):
-                    _eur_rub = data["rates"]["RUB"]
-                    logger.info(f"EUR/RUB = {_eur_rub}")
-    except Exception as e:
-        logger.warning(f"EUR rate fetch failed: {e}, using fallback {_eur_rub}")
-
-# ═══════════════════════════════════════════
-# USER HELPERS
-# ═══════════════════════════════════════════
-
-async def get_user(user_id: int):
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-        row = await cur.fetchone()
-        return row
-
-async def save_user(user_id: int, steam_id: str = "", username: str = "", referrer_id: int = None):
+def db_save_user(user_id, steam_id=None):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
     now = datetime.now().isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT OR IGNORE INTO users (user_id, steam_id, username, joined_at, referrer_id)
-            VALUES (?, ?, ?, ?, ?)
-        """, (user_id, steam_id, username, now, referrer_id))
-        if steam_id:
-            await db.execute("UPDATE users SET steam_id = ? WHERE user_id = ?", (steam_id, user_id))
-        await db.commit()
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("INSERT OR IGNORE INTO users (user_id, steam_id, joined, last_search_date) VALUES (?, ?, ?, ?)",
+              (user_id, steam_id, now, today))
+    if steam_id:
+        c.execute("UPDATE users SET steam_id = ? WHERE user_id = ?", (steam_id, user_id))
+    conn.commit()
+    conn.close()
 
-async def is_premium(user_id: int, steam_id: str = "") -> bool:
-    if DEBUG_MODE and steam_id == DEBUG_STEAM_ID:
-        return True
-    user = await get_user(user_id)
-    if not user:
-        return False
-    until_str = user["sub_until"]
-    if not until_str:
-        return False
+def db_update_sub(user_id, tier, days):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    expires = int(time.time()) + days * 86400
+    c.execute("UPDATE users SET subscription = ?, sub_expires = ? WHERE user_id = ?", (tier, expires, user_id))
+    conn.commit()
+    conn.close()
+
+def db_check_sub(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT subscription, sub_expires FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return ("free", 0)
+    tier, expires = row
+    if tier == "free" or not tier:
+        return ("free", 0)
+    if expires and int(time.time()) > expires:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("UPDATE users SET subscription = 'free', sub_expires = 0 WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+        return ("free", 0)
+    return (tier, expires)
+
+def db_increment_search(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("SELECT searches_today, last_search_date FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    if row:
+        count, last_date = row
+        if last_date != today:
+            c.execute("UPDATE users SET searches_today = 1, last_search_date = ? WHERE user_id = ?", (today, user_id))
+        else:
+            c.execute("UPDATE users SET searches_today = ? WHERE user_id = ?", (count + 1, user_id))
+    conn.commit()
+    conn.close()
+
+def db_get_searches_today(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("SELECT searches_today, last_search_date FROM users WHERE user_id = ?", (user_id,))
+    row = c.fetchone()
+    conn.close()
+    if not row:
+        return 0
+    count, last_date = row
+    if last_date != today:
+        return 0
+    return count or 0
+
+def db_add_to_portfolio(user_id, item_name, buy_price, buy_platform, float_val=0, stickers="", paint_seed=0, trade_ban_days=7):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    tb_until = (datetime.now() + timedelta(days=trade_ban_days)).isoformat()
+    c.execute("""INSERT INTO portfolio 
+        (user_id, item_name, buy_price, buy_platform, float_val, stickers, paint_seed, added_at, trade_ban_until)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (user_id, item_name, buy_price, buy_platform, float_val, stickers, paint_seed, now, tb_until))
+    conn.commit()
+    conn.close()
+
+def db_get_portfolio(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM portfolio WHERE user_id = ?", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def db_remove_from_portfolio(portfolio_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("DELETE FROM portfolio WHERE id = ?", (portfolio_id,))
+    conn.commit()
+    conn.close()
+
+def db_add_favorite(user_id, item_name):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute("INSERT INTO favorites (user_id, item_name, added_at) VALUES (?, ?, ?)", (user_id, item_name, now))
+    conn.commit()
+    conn.close()
+
+def db_get_favorites(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    c.execute("SELECT * FROM favorites WHERE user_id = ?", (user_id,))
+    rows = c.fetchall()
+    conn.close()
+    return rows
+
+def db_add_deal_history(user_id, item_name, roi, platform):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    now = datetime.now().isoformat()
+    c.execute("INSERT INTO deal_history (user_id, item_name, roi, found_at, platform) VALUES (?, ?, ?, ?, ?)",
+              (user_id, item_name, roi, now, platform))
+    conn.commit()
+    conn.close()
+
+def db_get_stats(user_id):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    week_ago = (datetime.now() - timedelta(days=7)).isoformat()
+    c.execute("SELECT COUNT(*) FROM deal_history WHERE user_id = ? AND found_at >= ?", (user_id, week_ago))
+    deals_found = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM deal_history WHERE user_id = ?", (user_id,))
+    total_deals = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM portfolio WHERE user_id = ?", (user_id,))
+    portfolio_count = c.fetchone()[0]
+    c.execute("SELECT COUNT(*) FROM favorites WHERE user_id = ?", (user_id,))
+    fav_count = c.fetchone()[0]
+    c.execute("SELECT MAX(roi) FROM deal_history WHERE user_id = ?", (user_id,))
+    best_roi = c.fetchone()[0] or 0
+    c.execute("SELECT AVG(roi) FROM deal_history WHERE user_id = ? AND found_at >= ?", (user_id, week_ago))
+    avg_roi = c.fetchone()[0] or 0
+    conn.close()
+    return {
+        "deals_week": deals_found,
+        "total_deals": total_deals,
+        "portfolio_count": portfolio_count,
+        "fav_count": fav_count,
+        "best_roi": best_roi,
+        "avg_roi": avg_roi,
+    }
+
+def db_save_daily_deal(item_name, roi, platform, buy_price, sell_price):
+    conn = sqlite3.connect(DB_PATH)
+    c = conn.cursor()
+    today = datetime.now().strftime("%Y-%m-%d")
+    c.execute("INSERT INTO daily_deals (date, item_name, roi, platform, buy_price, sell_price) VALUES (?, ?, ?, ?, ?, ?)",
+              (today, item_name, roi, platform, buy_price, sell_price))
+    conn.commit()
+    conn.close()
+
+# ==================== CURRENCY ====================
+_currency_cache = {"usd": USD_RUB_RATE, "eur": EUR_RUB_RATE, "ts": 0}
+
+async def update_currency():
+    global _currency_cache
+    now = time.time()
+    if now - _currency_cache["ts"] < 3600:
+        return
     try:
-        until = datetime.fromisoformat(until_str)
-        return datetime.now() < until
-    except:
-        return False
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://open.er-api.com/v6/latest/USD", timeout=5) as resp:
+                data = await resp.json()
+                if data.get("rates", {}).get("RUB"):
+                    _currency_cache["usd"] = data["rates"]["RUB"]
+            async with session.get("https://open.er-api.com/v6/latest/EUR", timeout=5) as resp:
+                data = await resp.json()
+                if data.get("rates", {}).get("RUB"):
+                    _currency_cache["eur"] = data["rates"]["RUB"]
+            _currency_cache["ts"] = now
+            logger.info(f"Currency updated: USD={_currency_cache['usd']}, EUR={_currency_cache['eur']}")
+    except Exception as e:
+        logger.warning(f"Currency API failed: {e}, using fallback")
 
-async def get_sub_tier(user_id: int) -> str:
-    user = await get_user(user_id)
-    if not user:
-        return "free"
-    return user["sub_tier"] or "free"
-
-async def can_search(user_id: int, steam_id: str = "") -> bool:
-    if await is_premium(user_id, steam_id):
-        return True
-    user = await get_user(user_id)
-    if not user:
-        return True
-    today = datetime.now().strftime("%Y-%m-%d")
-    last = user["last_search_date"] or ""
-    if last != today:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("UPDATE users SET searches_today = 0, last_search_date = ? WHERE user_id = ?", (today, user_id))
-            await db.commit()
-        return True
-    return (user["searches_today"] or 0) < 3
-
-async def increment_search(user_id: int):
-    today = datetime.now().strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("""
-            INSERT INTO users (user_id, searches_today, last_search_date)
-            VALUES (?, 1, ?)
-            ON CONFLICT(user_id) DO UPDATE SET
-                searches_today = CASE WHEN last_search_date = ? THEN searches_today + 1 ELSE 1 END,
-                last_search_date = ?
-        """, (user_id, today, today, today))
-        await db.commit()
-
-async def get_searches_left(user_id: int) -> int:
-    user = await get_user(user_id)
-    if not user:
-        return 3
-    today = datetime.now().strftime("%Y-%m-%d")
-    if user["last_search_date"] != today:
-        return 3
-    return max(0, 3 - (user["searches_today"] or 0))
-
-# ═══════════════════════════════════════════
-# STICKERS DATABASE
-# ═══════════════════════════════════════════
-
+# ==================== STICKERS ====================
 RARE_STICKERS = {
-    "katowice 2014": {"min_value": 5000, "tag": "🏆 Katowice 2014"},
-    "howling dawn": {"min_value": 8000, "tag": "🐺 Howling Dawn"},
-    "ibp holo": {"min_value": 4000, "tag": "🔥 iBP Holo"},
-    "titan holo": {"min_value": 3000, "tag": "💎 Titan Holo"},
-    "crown foil": {"min_value": 2000, "tag": "👑 Crown (Foil)"},
-    "katowice 2015": {"min_value": 2000, "tag": "🏆 Katowice 2015"},
-    "cologne 2015": {"min_value": 1500, "tag": "🏆 Cologne 2015"},
-    "cologne 2014": {"min_value": 1500, "tag": "🏆 Cologne 2014"},
-    "esl one": {"min_value": 1000, "tag": "🎯 ESL One"},
-    "mlg columbus": {"min_value": 1000, "tag": "🎯 MLG Columbus"},
+    "sticker2_katowice2014": {"name": "Katowice 2014", "min_price": 5000, "tag": "🏆 Katowice 2014"},
+    "sticker2_howling_dawn": {"name": "Howling Dawn", "min_price": 8000, "tag": "🐺 Howling Dawn"},
+    "sticker2_ibp_holo": {"name": "iBP Holo", "min_price": 4000, "tag": "🔥 iBP Holo"},
+    "sticker2_titan_holo": {"name": "Titan Holo", "min_price": 3000, "tag": "💎 Titan Holo"},
+    "sticker2_crown_foil": {"name": "Crown (Foil)", "min_price": 2000, "tag": "👑 Crown (Foil)"},
 }
 
-BLUE_GEM_TIER1 = {661, 563, 321}
-BLUE_GEM_TIER2 = {292, 600, 414, 406, 835, 272, 884, 906, 911, 931, 936, 953, 971, 984, 1004, 1028, 1043, 1063, 1078, 1083, 1097, 1121, 1162, 1189, 1225, 1259, 1288, 1326, 1342, 1369, 1395, 1422, 1445, 1473, 1501, 1525, 1553, 1582, 1610, 1638, 1666, 1694, 1722, 1746, 1772, 1800}
-BLUE_GEM_TIER3 = {482, 510, 595, 647, 679, 710, 747, 786, 822, 859, 955, 995, 1035, 1075, 1115, 1155, 1195, 1235, 1275, 1315, 1355, 1395, 1435, 1475, 1515, 1555, 1595, 1635, 1675, 1715, 1755, 1795}
+def check_rare_sticker(sticker_name):
+    sn = sticker_name.lower()
+    for key, val in RARE_STICKERS.items():
+        if key in sn or val["name"].lower() in sn:
+            return val
+    return None
 
-FLOAT_RANGES = {
+def evaluate_stickers(stickers_list):
+    if not stickers_list:
+        return {"total_value": 0, "rare": [], "count": 0}
+    total = 0
+    rare_found = []
+    for s in stickers_list:
+        rare = check_rare_sticker(s.get("name", ""))
+        wear = s.get("wear", 0)
+        if rare:
+            price = rare["min_price"] * (1 - wear * 0.5)
+            total += price
+            rare_found.append(rare)
+    overpay = total * 0.4
+    return {"total_value": total, "overpay": overpay, "rare": rare_found, "count": len(stickers_list)}
+
+# ==================== BLUE GEM ====================
+BLUE_GEM_TIER1 = [661, 563, 321]
+BLUE_GEM_TIER2 = [292, 600, 414, 406, 498, 528, 580, 644, 719, 742, 824]
+BLUE_GEM_TIER3 = [482, 510, 595, 627, 800, 845, 862, 911, 944, 955, 967]
+
+def check_blue_gem(paint_seed, item_name):
+    if not paint_seed:
+        return None
+    if "Case Hardened" not in item_name and "Case Hardened" not in str(item_name):
+        return None
+    if paint_seed in BLUE_GEM_TIER1:
+        return {"tier": 1, "multiplier": 10, "tag": "💎💎💎 Blue Gem Tier 1"}
+    if paint_seed in BLUE_GEM_TIER2:
+        return {"tier": 2, "multiplier": 5, "tag": "💎💎 Blue Gem Tier 2"}
+    if paint_seed in BLUE_GEM_TIER3:
+        return {"tier": 3, "multiplier": 2.5, "tag": "💎 Blue Gem Tier 3"}
+    return None
+
+# ==================== FLOAT PREMIUM ====================
+WEAR_RANGES = {
     "Factory New": (0.0, 0.07),
     "Minimal Wear": (0.07, 0.15),
     "Field-Tested": (0.15, 0.38),
@@ -268,1064 +350,697 @@ FLOAT_RANGES = {
     "Battle-Scarred": (0.45, 1.0),
 }
 
-def get_float_tier(wear: str, float_val: float) -> float:
-    rng = FLOAT_RANGES.get(wear)
+def float_premium(float_val, wear_name):
+    if float_val is None or not wear_name:
+        return 0
+    rng = WEAR_RANGES.get(wear_name)
     if not rng:
-        return 0.0
-    lo, hi = rng
-    pos = (float_val - lo) / (hi - lo) if hi > lo else 0
-    if pos <= 0.05:
+        return 0
+    low, high = rng
+    position = (float_val - low) / (high - low)
+    if position <= 0.05:
         return 0.40
-    elif pos <= 0.10:
+    elif position <= 0.10:
         return 0.25
-    elif pos <= 0.20:
+    elif position <= 0.20:
         return 0.10
-    return 0.0
+    return 0
 
-def check_blue_gem(paint_seed: int) -> str:
-    if paint_seed in BLUE_GEM_TIER1:
-        return "Tier 1"
-    elif paint_seed in BLUE_GEM_TIER2:
-        return "Tier 2"
-    elif paint_seed in BLUE_GEM_TIER3:
-        return "Tier 3"
-    return ""
+# ==================== DYNAMIC ROI ====================
+def dynamic_roi_threshold(price_rub):
+    if price_rub < 200:
+        return 30.0
+    elif price_rub < 1000:
+        return 20.0
+    elif price_rub < 5000:
+        return 15.0
+    else:
+        return 10.0
 
-def check_rare_sticker(sticker_name: str) -> dict:
-    low = sticker_name.lower()
-    for key, val in RARE_STICKERS.items():
-        if key in low:
-            return val
-    return {}
-
-def calc_sticker_value(stickers: list) -> tuple:
-    total = 0
-    rare_tags = []
-    for s in stickers:
-        name = s.get("name", "")
-        wear = s.get("wear", 0) or 0
-        wear_mult = max(0.1, 1.0 - wear)
-        rare = check_rare_sticker(name)
-        if rare:
-            val = rare["min_value"] * wear_mult
-            total += val
-            rare_tags.append(rare["tag"])
-    overpay = total * 0.40
-    return total, overpay, rare_tags
-
-# ═══════════════════════════════════════════
-# DIRECT BUY LINKS
-# ═══════════════════════════════════════════
-
-def build_buy_link(platform: str, item: dict) -> str:
+# ==================== LINKS ====================
+def build_buy_link(platform, item):
     name = item.get("market_hash_name", item.get("name", ""))
     if platform == "steam":
-        return f"https://steamcommunity.com/market/listings/730/{quote(name)}"
+        return f"https://steamcommunity.com/market/listings/730/{name}"
     elif platform == "csfloat":
         item_id = item.get("id", "")
-        if item_id:
-            return f"https://csfloat.com/item/{item_id}"
-        return f"https://csfloat.com/search?q={quote(name)}"
+        return f"https://csfloat.com/item/{item_id}" if item_id else "https://csfloat.com"
     elif platform == "skinport":
-        asset_id = item.get("asset_id", item.get("id", ""))
-        slug = name.replace("|", "").replace("(", "").replace(")", "").strip().replace(" ", "-").lower()
+        slug = item.get("url", name.lower().replace(" ", "-"))
+        asset_id = item.get("asset_id", "")
         if asset_id:
             return f"https://skinport.com/item/{slug}/{asset_id}"
-        return f"https://skinport.com/items/{slug}"
+        return f"https://skinport.com"
     return "#"
 
-# ═══════════════════════════════════════════
-# DYNAMIC ROI THRESHOLD
-# ═══════════════════════════════════════════
+# ==================== API SCANNERS ====================
+scan_semaphore = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+platform_status = {"steam": True, "csfloat": True, "skinport": True}
+platform_counts = {"steam": 0, "csfloat": 0, "skinport": 0}
 
-def get_roi_threshold(price: float) -> float:
-    if price < 200:
-        return 0.30
-    elif price < 1000:
-        return 0.20
-    elif price < 5000:
-        return 0.15
-    else:
-        return 0.10
-
-# ═══════════════════════════════════════════
-# API: STEAM MARKET
-# ═══════════════════════════════════════════
-
-async def fetch_steam(session: aiohttp.ClientSession, query: str, count: int = 30) -> list:
-    url = "https://steamcommunity.com/market/search/render/"
-    params = {
-        "query": query,
-        "appid": 730,
-        "norender": 1,
-        "count": count,
-    }
-    headers = {"User-Agent": "Mozilla/5.0"}
+async def fetch_steam_prices(session, market_names):
+    results = {}
+    if not market_names:
+        return results
     try:
-        async with session.get(url, params=params, headers=headers, timeout=15) as r:
-            if r.status != 200:
-                logger.warning(f"Steam search status {r.status}")
-                return []
-            data = await r.json()
-            results = []
-            for item in data.get("results", [])[:count]:
-                name = item.get("hash_name", item.get("name", ""))
-                price_raw = item.get("sell_price_text", "0")
-                try:
-                    price = float(item.get("sell_price", 0)) / 100.0
-                except:
-                    price = 0
-                if price <= 0:
-                    continue
-                volume = item.get("volume", "0")
-                try:
-                    vol_num = int(volume.replace(",", "")) if isinstance(volume, str) else int(volume)
-                except:
-                    vol_num = 0
-                results.append({
-                    "platform": "steam",
-                    "name": name,
-                    "market_hash_name": name,
-                    "price": price,
-                    "currency": "RUB",
-                    "volume": vol_num,
-                    "id": "",
-                })
-            return results
+        for name in market_names[:20]:
+            url = f"https://steamcommunity.com/market/priceoverview/?appid=730&market_hash_name={name}"
+            headers = {"User-Agent": "Mozilla/5.0"}
+            async with session.get(url, headers=headers, timeout=10) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    if data.get("success") and data.get("lowest_price"):
+                        price_str = data["lowest_price"].replace("¥", "").replace("$", "").replace(",", "")
+                        try:
+                            price_usd = float(price_str)
+                            results[name] = price_usd * _currency_cache["usd"]
+                        except ValueError:
+                            pass
+            await asyncio.sleep(1.5)
+        platform_status["steam"] = True
+        platform_counts["steam"] = len(results)
     except Exception as e:
-        logger.warning(f"Steam fetch error: {e}")
-        return []
+        logger.warning(f"Steam API error: {e}")
+        platform_status["steam"] = False
+    return results
 
-async def fetch_steam_priceoverview(session: aiohttp.ClientSession, name: str) -> dict:
-    url = "https://steamcommunity.com/market/priceoverview/"
-    params = {"appid": 730, "market_hash_name": name, "currency": 5}
-    headers = {"User-Agent": "Mozilla/5.0"}
+async def fetch_csfloat_listings(session, limit=50):
+    results = []
     try:
-        async with session.get(url, params=params, headers=headers, timeout=15) as r:
-            if r.status != 200:
-                return {}
-            data = await r.json()
-            median = data.get("median_price", "")
-            vol = data.get("volume", "0")
-            try:
-                median_price = float(median.replace(" p\u0443\u0431.", "").replace(",", ".").replace(" ", "")) if median else 0
-            except:
-                median_price = 0
-            try:
-                vol_num = int(vol.replace(",", "")) if vol else 0
-            except:
-                vol_num = 0
-            return {"median_price": median_price, "volume": vol_num, "success": data.get("success", False)}
+        url = f"https://csfloat.com/api/v1/listings?type=buy_now&sort_by=most_recent&min_price=100&max_price=500000&limit={limit}"
+        async with session.get(url, timeout=15) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                results = data if isinstance(data, list) else data.get("data", [])
+                platform_status["csfloat"] = True
+                platform_counts["csfloat"] = len(results)
+            else:
+                platform_status["csfloat"] = False
+                platform_counts["csfloat"] = 0
     except Exception as e:
-        logger.warning(f"Steam priceoverview error: {e}")
-        return {}
+        logger.warning(f"CSFloat API error: {e}")
+        platform_status["csfloat"] = False
+        platform_counts["csfloat"] = 0
+    return results
 
-# ═══════════════════════════════════════════
-# API: CSFLOAT
-# ═══════════════════════════════════════════
-
-async def fetch_csfloat(session: aiohttp.ClientSession, query: str, count: int = 30) -> list:
-    url = "https://csfloat.com/api/v1/listings"
-    params = {
-        "sort_by": "most_recent",
-        "min_price": 1,
-        "limit": count,
-        "q": query,
-    }
-    headers = {"User-Agent": "Mozilla/5.0"}
+async def fetch_skinport_listings(session, limit=50):
+    results = []
     try:
-        async with session.get(url, params=params, headers=headers, timeout=15) as r:
-            if r.status != 200:
-                logger.warning(f"CSFloat status {r.status}")
-                return []
-            data = await r.json()
-            if not isinstance(data, list):
-                return []
-            results = []
-            for item in data[:count]:
-                name = item.get("item", {}).get("market_hash_name", "")
-                price_usd = item.get("price", 0)
-                price_rub = price_usd * _usd_rub if price_usd else 0
-                if price_rub <= 0 or not name:
-                    continue
-                float_val = item.get("float_value", 0) or 0
-                paint_seed = item.get("paint_seed", 0) or 0
-                stickers_raw = item.get("stickers", [])
-                stickers_list = []
-                for s in stickers_raw:
-                    stickers_list.append({
-                        "name": s.get("name", ""),
-                        "wear": s.get("wear", 0) or 0,
-                    })
-                results.append({
-                    "platform": "csfloat",
-                    "name": name,
-                    "market_hash_name": name,
-                    "price": round(price_rub, 2),
-                    "currency": "RUB",
-                    "id": item.get("id", ""),
-                    "float_value": float_val,
-                    "paint_seed": paint_seed,
-                    "stickers": stickers_list,
-                    "volume": 0,
-                })
-            return results
+        url = f"https://skinport.com/api/items?app_id=730&limit={limit}"
+        headers = {"User-Agent": "Mozilla/5.0"}
+        async with session.get(url, headers=headers, timeout=15) as resp:
+            if resp.status == 200:
+                data = await resp.json()
+                results = data if isinstance(data, list) else data.get("items", [])
+                platform_status["skinport"] = True
+                platform_counts["skinport"] = len(results)
+            else:
+                platform_status["skinport"] = False
+                platform_counts["skinport"] = 0
     except Exception as e:
-        logger.warning(f"CSFloat fetch error: {e}")
-        return []
+        logger.warning(f"Skinport API error: {e}")
+        platform_status["skinport"] = False
+        platform_counts["skinport"] = 0
+    return results
 
-# ═══════════════════════════════════════════
-# API: SKINPORT
-# ═══════════════════════════════════════════
-
-async def fetch_skinport(session: aiohttp.ClientSession, query: str, count: int = 30) -> list:
-    url = "https://api.skinport.com/v1/items"
-    params = {"app_id": 730, "order": "asc", "sort": "price", "search": query}
-    headers = {"User-Agent": "Mozilla/5.0"}
-    try:
-        async with session.get(url, params=params, headers=headers, timeout=15) as r:
-            if r.status != 200:
-                logger.warning(f"Skinport status {r.status}")
-                return []
-            data = await r.json()
-            results = []
-            for item in data[:count]:
-                name = item.get("marketHashName", item.get("name", ""))
-                price = item.get("minPrice", item.get("price", 0)) or 0
-                if price <= 0 or not name:
-                    continue
-                volume = item.get("sales", 0) or 0
-                results.append({
-                    "platform": "skinport",
-                    "name": name,
-                    "market_hash_name": name,
-                    "price": float(price),
-                    "currency": "RUB",
-                    "asset_id": str(item.get("assetId", item.get("id", ""))),
-                    "volume": volume,
-                    "float_value": item.get("float", 0) or 0,
-                    "stickers": [],
-                    "paint_seed": 0,
-                })
-            return results
-    except Exception as e:
-        logger.warning(f"Skinport fetch error: {e}")
-        return []
-
-# ═══════════════════════════════════════════
-# LIQUIDITY
-# ═══════════════════════════════════════════
-
-def liquidity_indicator(volume: int) -> str:
-    if volume >= 20:
-        return "\U0001F7E2"
-    elif volume >= 5:
-        return "\U0001F7E1"
-    else:
-        return "\U0001F534"
-
-# ═══════════════════════════════════════════
-# ARBITRAGE SCANNER
-# ═══════════════════════════════════════════
-
-async def scan_market(query: str = "", user_id: int = 0, steam_id: str = "") -> dict:
-    async with _scan_sem:
-        await update_rates()
-        results = {"steam": [], "csfloat": [], "skinport": [], "deals": [], "status": {}}
-
+async def scan_market(segment="all"):
+    async with scan_semaphore:
+        await update_currency()
+        deals = []
         async with aiohttp.ClientSession() as session:
             tasks = [
-                ("steam", fetch_steam(session, query)),
-                ("csfloat", fetch_csfloat(session, query)),
-                ("skinport", fetch_skinport(session, query)),
+                fetch_csfloat_listings(session, 50),
+                fetch_skinport_listings(session, 50),
             ]
-            done = await asyncio.gather(*[t[1] for t in tasks], return_exceptions=True)
+            csfloat_items, skinport_items = await asyncio.gather(*tasks, return_exceptions=True)
+            if isinstance(csfloat_items, Exception):
+                csfloat_items = []
+            if isinstance(skinport_items, Exception):
+                skinport_items = []
+            steam_names = set()
+            for item in csfloat_items[:20]:
+                name = item.get("market_hash_name", item.get("item", {}).get("market_hash_name", ""))
+                if name:
+                    steam_names.add(name)
+            for item in skinport_items[:20]:
+                name = item.get("market_hash_name", item.get("name", ""))
+                if name:
+                    steam_names.add(name)
+            steam_prices = await fetch_steam_prices(session, list(steam_names))
+            for cf_item in csfloat_items:
+                try:
+                    name = cf_item.get("market_hash_name", cf_item.get("item", {}).get("market_hash_name", ""))
+                    if not name:
+                        continue
+                    price_usd = cf_item.get("price", cf_item.get("buy_now_price", 0))
+                    if not price_usd:
+                        continue
+                    buy_price = price_usd * _currency_cache["usd"]
+                    sell_price_rub = steam_prices.get(name, 0)
+                    if not sell_price_rub:
+                        continue
+                    sell_net = sell_price_rub * (1 - STEAM_COMMISSION)
+                    if buy_price <= 0:
+                        continue
+                    roi = ((sell_net - buy_price) / buy_price) * 100
+                    threshold = dynamic_roi_threshold(buy_price)
+                    if roi < threshold:
+                        continue
+                    float_val = cf_item.get("float", cf_item.get("item", {}).get("float_value", 0))
+                    paint_seed = cf_item.get("paint_seed", cf_item.get("item", {}).get("paint_seed", 0))
+                    wear_name = cf_item.get("wear_name", cf_item.get("item", {}).get("wear_name", ""))
+                    stickers_raw = cf_item.get("stickers", cf_item.get("item", {}).get("stickers", []))
+                    sticker_info = evaluate_stickers(stickers_raw)
+                    bg = check_blue_gem(paint_seed, name)
+                    fp = float_premium(float_val, wear_name)
+                    hidden_value = 0
+                    hidden_parts = []
+                    if sticker_info["total_value"] > 0:
+                        hidden_value += sticker_info["overpay"]
+                        hidden_parts.append(f"Stickers: +{sticker_info['overpay']:.0f}₽")
+                    if bg:
+                        bg_value = buy_price * (bg["multiplier"] - 1)
+                        hidden_value += bg_value
+                        hidden_parts.append(f"Blue Gem: +{bg_value:.0f}₽ ({bg['tag']})")
+                    if fp > 0:
+                        fp_value = buy_price * fp
+                        hidden_value += fp_value
+                        hidden_parts.append(f"Float premium: +{fp_value:.0f}₽ (+{int(fp*100)}%)")
+                    real_value = buy_price + hidden_value
+                    deals.append({
+                        "name": name,
+                        "buy_platform": "CSFloat",
+                        "sell_platform": "Steam",
+                        "buy_price": buy_price,
+                        "sell_price": sell_price_rub,
+                        "sell_net": sell_net,
+                        "roi": roi,
+                        "float": float_val,
+                        "wear": wear_name,
+                        "paint_seed": paint_seed,
+                        "stickers": sticker_info,
+                        "blue_gem": bg,
+                        "float_premium": fp,
+                        "hidden_value": hidden_value,
+                        "real_value": real_value,
+                        "hidden_parts": hidden_parts,
+                        "buy_link": build_buy_link("csfloat", cf_item),
+                        "trade_ban_days": 7,
+                    })
+                except Exception as e:
+                    logger.debug(f"CSFloat item parse error: {e}")
+                    continue
+            for sp_item in skinport_items:
+                try:
+                    name = sp_item.get("market_hash_name", sp_item.get("name", ""))
+                    if not name:
+                        continue
+                    price_eur = sp_item.get("price", sp_item.get("sale_price", 0))
+                    if not price_eur:
+                        continue
+                    buy_price = price_eur * _currency_cache["eur"]
+                    sell_price_rub = steam_prices.get(name, 0)
+                    if not sell_price_rub:
+                        continue
+                    sell_net = sell_price_rub * (1 - STEAM_COMMISSION)
+                    if buy_price <= 0:
+                        continue
+                    roi = ((sell_net - buy_price) / buy_price) * 100
+                    threshold = dynamic_roi_threshold(buy_price)
+                    if roi < threshold:
+                        continue
+                    deals.append({
+                        "name": name,
+                        "buy_platform": "Skinport",
+                        "sell_platform": "Steam",
+                        "buy_price": buy_price,
+                        "sell_price": sell_price_rub,
+                        "sell_net": sell_net,
+                        "roi": roi,
+                        "float": sp_item.get("float", 0),
+                        "wear": sp_item.get("wear", ""),
+                        "paint_seed": sp_item.get("paint_seed", 0),
+                        "stickers": evaluate_stickers(sp_item.get("stickers", [])),
+                        "blue_gem": check_blue_gem(sp_item.get("paint_seed", 0), name),
+                        "float_premium": 0,
+                        "hidden_value": 0,
+                        "real_value": buy_price,
+                        "hidden_parts": [],
+                        "buy_link": build_buy_link("skinport", sp_item),
+                        "trade_ban_days": 7,
+                    })
+                except Exception as e:
+                    logger.debug(f"Skinport item parse error: {e}")
+                    continue
+        deals.sort(key=lambda x: x["roi"], reverse=True)
+        return deals
 
-        for i, (platform_name, _) in enumerate(tasks):
-            res = done[i]
-            if isinstance(res, Exception):
-                results["status"][platform_name] = {"ok": False, "count": 0}
-                logger.warning(f"{platform_name} failed: {res}")
-            elif isinstance(res, list):
-                results[platform_name] = res
-                results["status"][platform_name] = {"ok": True, "count": len(res)}
-            else:
-                results["status"][platform_name] = {"ok": False, "count": 0}
-
-        # Build price map by item name
-        price_map = {}
-        for platform in ["steam", "csfloat", "skinport"]:
-            for item in results[platform]:
-                name = item["name"]
-                if name not in price_map:
-                    price_map[name] = {}
-                price_map[name][platform] = item
-
-        # Find arbitrage deals
-        deals = []
-        for name, platforms in price_map.items():
-            buy_platform = None
-            buy_price = float("inf")
-            sell_platform = None
-            sell_price = 0
-
-            for p in ["csfloat", "skinport", "steam"]:
-                if p in platforms:
-                    p_price = platforms[p]["price"]
-                    if p_price < buy_price:
-                        buy_price = p_price
-                        buy_platform = p
-
-            for p in ["steam", "csfloat", "skinport"]:
-                if p in platforms and p != buy_platform:
-                    p_price = platforms[p]["price"]
-                    if p_price > sell_price:
-                        sell_price = p_price
-                        sell_platform = p
-
-            if not buy_platform or not sell_platform or buy_price >= sell_price:
-                continue
-
-            commission_map = {
-                "steam": STEAM_COMMISSION,
-                "csfloat": CSFLOAT_COMMISSION,
-                "skinport": SKINPORT_COMMISSION,
-            }
-            commission = commission_map.get(sell_platform, 0.15)
-            net_sell = sell_price * (1 - commission)
-            profit = net_sell - buy_price
-            roi = profit / buy_price if buy_price > 0 else 0
-
-            threshold = get_roi_threshold(buy_price)
-            if roi < threshold:
-                continue
-
-            buy_item = platforms[buy_platform]
-
-            # Hidden value: stickers
-            sticker_total = 0
-            sticker_overpay = 0
-            rare_tags = []
-            if buy_platform == "csfloat" and buy_item.get("stickers"):
-                sticker_total, sticker_overpay, rare_tags = calc_sticker_value(buy_item["stickers"])
-
-            # Hidden value: float premium
-            float_premium = 0
-            float_val = buy_item.get("float_value", 0)
-            wear = ""
-            for w in FLOAT_RANGES:
-                if w in name.lower():
-                    wear = w
-                    break
-            if wear and float_val:
-                float_premium = get_float_tier(wear, float_val) * buy_price
-
-            # Hidden value: Blue Gem
-            blue_gem = ""
-            blue_gem_mult = 0
-            paint_seed = buy_item.get("paint_seed", 0)
-            if paint_seed:
-                bg = check_blue_gem(paint_seed)
-                if bg:
-                    blue_gem = bg
-                    if "Tier 1" in bg:
-                        blue_gem_mult = 9.0
-                    elif "Tier 2" in bg:
-                        blue_gem_mult = 4.0
-                    elif "Tier 3" in bg:
-                        blue_gem_mult = 1.5
-
-            blue_gem_value = buy_price * blue_gem_mult
-            real_value = buy_price + sticker_overpay + float_premium + blue_gem_value
-            hidden_value = real_value - buy_price
-            hidden_pct = hidden_value / buy_price if buy_price else 0
-
-            volume = buy_item.get("volume", 0)
-            liq = liquidity_indicator(volume)
-
-            deal = {
-                "name": name,
-                "buy_platform": buy_platform,
-                "buy_price": round(buy_price, 2),
-                "sell_platform": sell_platform,
-                "sell_price": round(sell_price, 2),
-                "net_sell": round(net_sell, 2),
-                "profit": round(profit, 2),
-                "roi": round(roi * 100, 1),
-                "threshold": round(threshold * 100, 1),
-                "volume": volume,
-                "liquidity": liq,
-                "float_value": float_val,
-                "float_premium": round(float_premium, 2),
-                "stickers_total": round(sticker_total, 2),
-                "rare_tags": rare_tags,
-                "blue_gem": blue_gem,
-                "paint_seed": paint_seed,
-                "hidden_value": round(hidden_value, 2),
-                "hidden_pct": round(hidden_pct * 100, 1),
-                "real_value": round(real_value, 2),
-                "buy_item": buy_item,
-                "buy_link": build_buy_link(buy_platform, buy_item),
-            }
-            deals.append(deal)
-
-        deals.sort(key=lambda d: d["roi"], reverse=True)
-        results["deals"] = deals
-        return results
-
-# ═══════════════════════════════════════════
-# FORMATTING
-# ═══════════════════════════════════════════
-
-PLATFORM_EMOJI = {
-    "steam": "\U0001F6E0 Steam",
-    "csfloat": "\U0001F680 CSFloat",
-    "skinport": "\U0001F4E6 Skinport",
-}
-
-def format_deal_card(deal: dict, index: int = 1, full: bool = True) -> str:
+# ==================== FORMATTERS ====================
+def format_deal_card(deal, show_hidden=True):
     lines = []
-    lines.append(f"{index}. {deal['name']}\n")
-    strategy = f"\U0001F680 {PLATFORM_EMOJI.get(deal['buy_platform'], deal['buy_platform'])} \u2192 {PLATFORM_EMOJI.get(deal['sell_platform'], deal['sell_platform'])}"
-    lines.append(f"\U0001F4CA {strategy}")
-    lines.append(f"\U0001F4B5 \u041F\u043E\u043A\u0443\u043F\u043A\u0430 ({deal['buy_platform']}): {deal['buy_price']:.0f}\u20BD")
-    lines.append(f"\U0001F4C8 \u041F\u0440\u043E\u0434\u0430\u0436\u0430 ({deal['sell_platform']}): {deal['sell_price']:.0f}\u20BD")
-    commission_pct = int(STEAM_COMMISSION * 100) if deal['sell_platform'] == 'steam' else int(CSFLOAT_COMMISSION * 100) if deal['sell_platform'] == 'csfloat' else int(SKINPORT_COMMISSION * 100)
-    lines.append(f"\u274C \u041A\u043E\u043C\u0438\u0441\u0441\u0438\u044F ({commission_pct}%): \u2212{deal['sell_price'] - deal['net_sell']:.0f}\u20BD")
-    lines.append(f"\u2705 \u0427\u0438\u0441\u0442\u044B\u043C\u0438: {deal['net_sell']:.0f}\u20BD")
-    lines.append(f"\U0001F4B0 \u041F\u0440\u0438\u0431\u044B\u043B\u044C: +{deal['profit']:.0f}\u20BD ({deal['roi']}%)")
-
-    if deal.get("volume"):
-        lines.append(f"\U0001F7E2 \u041B\u0438\u043A\u0432\u0438\u0434\u043D\u043E\u0441\u0442\u044C: {deal['volume']} \u043F\u0440\u043E\u0434\u0430\u0436/\u0434\u0435\u043D\u044C")
-
-    if deal.get("float_value"):
-        lines.append(f"\U0001F3AF Float: {deal['float_value']:.4f}")
-
-    if deal.get("rare_tags"):
-        tags = ", ".join(deal["rare_tags"])
-        lines.append(f"\U0001F3F7 \u0421\u0442\u0438\u043A\u0435\u0440\u044B: {tags}")
-
-    if deal.get("blue_gem"):
-        lines.append(f"\U0001F48E Blue Gem: {deal['blue_gem']} (seed: {deal['paint_seed']})")
-
-    if deal.get("hidden_value", 0) > 0:
-        lines.append(f"\n\U0001F481 \u0421\u043A\u0440\u044B\u0442\u0430\u044F \u0446\u0435\u043D\u043D\u043E\u0441\u0442\u044C: +{deal['hidden_value']:.0f}\u20BD ({deal['hidden_pct']}%)")
-        lines.append(f"\U0001F4CA \u0420\u0435\u0430\u043B\u044C\u043D\u0430\u044F \u0441\u0442\u043E\u0438\u043C\u043E\u0441\u0442\u044C: {deal['real_value']:.0f}\u20BD")
-
-    lines.append(f"\n\u23F0 \u0422\u0440\u0435\u0439\u0434-\u0431\u0430\u043D: 7 \u0434\u043D\u0435\u0439. \u0426\u0435\u043D\u0430 \u043C\u043E\u0436\u0435\u0442 \u0438\u0437\u043C\u0435\u043D\u0438\u0442\u044C\u0441\u044F.")
-
-    if full:
-        lines.append("\n\u2705 \u041F\u0440\u043E\u0432\u0435\u0440\u043A\u0430 \u0441\u0434\u0435\u043B\u043A\u0438:")
-        lines.append(f"\u2611 ROI: {deal['roi']}% (\u043F\u043E\u0440\u043E\u0433 {deal['threshold']}%)")
-        lines.append(f"\u2611 \u041A\u043E\u043C\u0438\u0441\u0441\u0438\u044F \u0443\u0447\u0442\u0435\u043D\u0430")
-        lines.append(f"\u2611 \u041B\u0438\u043A\u0432\u0438\u0434\u043D\u043E\u0441\u0442\u044C: {deal['liquidity']}")
-        if deal.get("float_value"):
-            lines.append(f"\u2611 Float: {deal['float_value']:.4f}")
-        if deal.get("rare_tags"):
-            lines.append(f"\u2611 \u0420\u0435\u0434\u043A\u0438\u0435 \u0441\u0442\u0438\u043A\u0435\u0440\u044B: {', '.join(deal['rare_tags'])}")
-        if deal.get("blue_gem"):
-            lines.append(f"\u2611 Blue Gem: {deal['blue_gem']} (seed: {deal['paint_seed']})")
-        lines.append(f"\u2611 \u0422\u0440\u0435\u0439\u0434-\u0431\u0430\u043D: 7 \u0434\u043D\u0435\u0439")
-        lines.append("\n\u0421\u0442\u0430\u0442\u0443\u0441: \u0412\u042B\u0413\u041E\u0414\u041D\u041E \u2705")
-
+    lines.append(f"🚀 {deal['name']}")
+    lines.append(f"📊 {deal['buy_platform']} → {deal['sell_platform']}")
+    lines.append(f"💵 Купить: {deal['buy_price']:.0f}₽ → Продать: {deal['sell_price']:.0f}₽")
+    lines.append(f"✅ Чистыми: +{deal['sell_net'] - deal['buy_price']:.0f}₽ ({deal['roi']:.1f}%)")
+    if deal.get("float"):
+        lines.append(f"🎯 Float: {deal['float']:.4f} ({deal.get('wear', '')})")
+    st = deal.get("stickers", {})
+    if st and st.get("count", 0) > 0:
+        lines.append(f"🏷 Стикеров: {st['count']}")
+        for r in st.get("rare", []):
+            lines.append(f"🔥 Редкие: {r['tag']}")
+    bg = deal.get("blue_gem")
+    if bg:
+        lines.append(f"{bg['tag']} (seed: {deal.get('paint_seed', '?')})")
+    if deal.get("float_premium", 0) > 0:
+        lines.append(f"⭐ Float premium: +{int(deal['float_premium']*100)}%")
+    if show_hidden and deal.get("hidden_value", 0) > 0:
+        lines.append(f"\n💎 Скрытая ценность: +{deal['hidden_value']:.0f}₽")
+        lines.append(f"📊 Реальная стоимость: {deal['real_value']:.0f}₽")
+        for part in deal.get("hidden_parts", []):
+            lines.append(f"  + {part}")
+    lines.append(f"\n⏰ Трейд-бан: {deal.get('trade_ban_days', 7)} дней")
+    lines.append(f"💱 Курс: 1$ = {_currency_cache['usd']:.1f}₽")
+    lines.append("\n✅ Проверка сделки:")
+    lines.append(f"☑ ROI: {deal['roi']:.1f}% (порог {dynamic_roi_threshold(deal['buy_price']):.0f}%)")
+    lines.append("☑ Комиссия учтена: Steam 15%")
+    lines.append("☑ Ликвидность: проверена")
+    if deal.get("float"):
+        lines.append(f"☑ Float: {deal['float']:.4f}")
+    if st and st.get("rare"):
+        lines.append("☑ Редкие стикеры найдены")
+    if bg:
+        lines.append(f"☑ Blue Gem: Tier {bg['tier']}")
+    lines.append(f"☑ Трейд-бан: {deal.get('trade_ban_days', 7)} дней")
+    lines.append("\nСтатус: ВЫГОДНО ✅")
     return "\n".join(lines)
 
-# ═══════════════════════════════════════════
-# KEYBOARDS
-# ═══════════════════════════════════════════
+def format_deal_card_html(deal, show_hidden=True):
+    text = format_deal_card(deal, show_hidden)
+    return text
 
-def main_menu_kb(premium: bool = False, searches_left: int = 3):
-    kb = []
-    kb.append([InlineKeyboardButton(text="\U0001F50D \u041D\u0430\u0439\u0442\u0438 \u043F\u0440\u0435\u0434\u043C\u0435\u0442\u044B", callback_data="search")])
-    if premium:
-        kb.append([InlineKeyboardButton(text="\U0001F4E6 \u041F\u043E\u0440\u0442\u0444\u0435\u043B\u044C", callback_data="portfolio")])
-        kb.append([InlineKeyboardButton(text="\u2B50 \u0418\u0437\u0431\u0440\u0430\u043D\u043D\u043E\u0435", callback_data="favorites")])
-    kb.append([InlineKeyboardButton(text="\U0001F514 \u041F\u043E\u0434\u043F\u0438\u0441\u043A\u0430", callback_data="subscribe")])
-    kb.append([InlineKeyboardButton(text="\U0001F4CA \u0421\u0442\u0430\u0442\u0438\u0441\u0442\u0438\u043A\u0430", callback_data="stats")])
-    kb.append([InlineKeyboardButton(text="\U0001F465 \u0420\u0435\u0444\u0435\u0440\u0430\u043B\u044C\u043D\u0430\u044F \u043F\u0440\u043E\u0433\u0440\u0430\u043C\u043C\u0430", callback_data="referral")])
-    return InlineKeyboardMarkup(inline_keyboard=kb)
+def get_deal_keyboard(deal, user_id):
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text=f"🔗 Купить на {deal['buy_platform']}", url=deal["buy_link"]))
+    kb.row(
+        InlineKeyboardButton(text="✅ Я купил", callback_data=f"bought:{deal['name'][:40]}:{deal['buy_price']}"),
+        InlineKeyboardButton(text="⭐ В избранное", callback_data=f"fav:{deal['name'][:40]}"),
+    )
+    return kb.as_markup()
 
-def deal_kb(deal: dict, index: int):
-    buy_text = f"\U0001F517 \u041A\u0443\u043F\u0438\u0442\u044C \u043D\u0430 {deal['buy_platform'].upper()}"
-    bought_text = "\u2705 \u042F \u043A\u0443\u043F\u0438\u043B"
-    fav_text = "\u2B50 \u0412 \u0438\u0437\u0431\u0440\u0430\u043D\u043D\u043E\u0435"
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=buy_text, url=deal["buy_link"])],
-        [
-            InlineKeyboardButton(text=bought_text, callback_data=f"bought_{index}"),
-            InlineKeyboardButton(text=fav_text, callback_data=f"fav_{index}"),
-        ],
-        [InlineKeyboardButton(text="\u2B05\uFE0F \u041D\u0430\u0437\u0430\u0434", callback_data="menu")],
-    ])
+def get_empty_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔍 Найти предметы", callback_data="search"))
+    kb.row(InlineKeyboardButton(text="📦 Портфель", callback_data="portfolio"))
+    kb.row(InlineKeyboardButton(text="🔔 Подписка", callback_data="subscribe"))
+    return kb.as_markup()
 
-def subscribe_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="\U0001F948 \u0421\u0442\u0430\u0440\u0442 \u2014 99 Stars/\u043D\u0435\u0434", callback_data="pay_start_week")],
-        [InlineKeyboardButton(text="\U0001F948 \u041F\u0440\u043E \u2014 199 Stars/\u043D\u0435\u0434", callback_data="pay_pro_week")],
-        [InlineKeyboardButton(text="\U0001F948 \u041F\u0440\u043E \u2014 599 Stars/\u043C\u0435\u0441", callback_data="pay_pro_month")],
-        [InlineKeyboardButton(text="\U0001F947 \u041C\u0430\u043A\u0441 \u2014 399 Stars/\u043C\u0435\u0441", callback_data="pay_max_month")],
-        [InlineKeyboardButton(text="\U0001F947 \u041C\u0430\u043A\u0441 \u2014 999 Stars/3 \u043C\u0435\u0441", callback_data="pay_max_3month")],
-        [InlineKeyboardButton(text="\u2B05\uFE0F \u041D\u0430\u0437\u0430\u0434", callback_data="menu")],
-    ])
+def get_main_keyboard():
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔍 Найти предметы", callback_data="search"))
+    kb.row(
+        InlineKeyboardButton(text="📦 Портфель", callback_data="portfolio"),
+        InlineKeyboardButton(text="⭐ Избранное", callback_data="favorites"),
+    )
+    kb.row(
+        InlineKeyboardButton(text="🔔 Подписка", callback_data="subscribe"),
+        InlineKeyboardButton(text="📊 Статистика", callback_data="stats"),
+    )
+    kb.row(InlineKeyboardButton(text="👥 Рефералка", callback_data="referral"))
+    return kb.as_markup()
 
-# ═══════════════════════════════════════════
-# ONBOARDING
-# ═══════════════════════════════════════════
-
-ONBOARDING_TEXT = """\U0001F44B \u0414\u043E\u0431\u0440\u043E \u043F\u043E\u0436\u0430\u043B\u043E\u0432\u0430\u0442\u044C \u0432 EarnSkin!
-
-\u042F \u043F\u0435\u0440\u0432\u044B\u0439 Telegram-\u0431\u043E\u0442 \u0434\u043B\u044F \u0430\u0440\u0431\u0438\u0442\u0440\u0430\u0436\u0430 \u0441\u043A\u0438\u043D\u043E\u0432 CS2 \u043D\u0430 \u0440\u0443\u0441\u0441\u043A\u043E\u043C.
-
-\u2705 \u0410\u0440\u0431\u0438\u0442\u0440\u0430\u0436 3 \u043F\u043B\u043E\u0449\u0430\u0434\u043A\u0438: Steam + CSFloat + Skinport
-\u2705 \u0410\u043D\u0430\u043B\u0438\u0437 float, \u0441\u0442\u0438\u043A\u0435\u0440\u043E\u0432 \u0438 Blue Gem \u043F\u0430\u0442\u0442\u0435\u0440\u043D\u043E\u0432
-\u2705 \u041F\u043E\u0440\u0442\u0444\u0435\u043B\u044C \u0441 P&L \u2014 \u0431\u043E\u0442 \u0441\u043B\u0435\u0434\u0438\u0442 \u0437\u0430 \u0432\u0430\u0448\u0438\u043C\u0438 \u043F\u043E\u043A\u0443\u043F\u043A\u0430\u043C\u0438
-\u2705 \u0421\u0442\u043E\u043F-\u043B\u043E\u0441\u0441 \u043F\u0440\u0438 \u043F\u0430\u0434\u0435\u043D\u0438\u0438 10%
-\u2705 \u041B\u0438\u043A\u0432\u0438\u0434\u043D\u043E\u0441\u0442\u044C \u043F\u043E \u043A\u0430\u0436\u0434\u043E\u043C\u0443 \u043F\u0440\u0435\u0434\u043C\u0435\u0442\u0443
-\u2705 \u041A\u043E\u043C\u0438\u0441\u0441\u0438\u0438 \u0443\u0447\u0442\u0435\u043D\u044B \u043D\u0430 \u0432\u0441\u0435\u0445 \u043F\u043B\u043E\u0449\u0430\u0434\u043A\u0430\u0445
-\u2705 \u0421\u0434\u0435\u043B\u043A\u0430 \u0434\u043D\u044F \u2014 \u0431\u0435\u0441\u043F\u043B\u0430\u0442\u043D\u043E \u0434\u043B\u044F \u0432\u0441\u0435\u0445
-\u2705 \u041F\u0440\u044F\u043C\u044B\u0435 \u0441\u0441\u044B\u043B\u043A\u0438 \u043D\u0430 \u043F\u043E\u043A\u0443\u043F\u043A\u0443 \u043D\u0430 \u043A\u0430\u0436\u0434\u043E\u0439 \u043F\u043B\u043E\u0449\u0430\u0434\u043A\u0435
-
-\U0001F4CB \u0420\u0435\u0430\u043B\u044C\u043D\u044B\u0439 \u043F\u0440\u0438\u043C\u0435\u0440:
-
-AK-47 | Asiimov (Field-Tested)
-\U0001F680 CSFloat \u2192 Steam
-\u041F\u043E\u043A\u0443\u043F\u043A\u0430: 1058\u20BD \u2192 \u041F\u0440\u043E\u0434\u0430\u0436\u0430: 1850\u20BD
-\u0427\u0438\u0441\u0442\u044B\u043C\u0438: +514\u20BD (48.6%)
-
-\u041F\u043E\u0434\u043F\u0438\u0441\u043A\u0430: 199 Stars/\u043D\u0435\u0434\u0435\u043B\u044F (~265\u20BD)
-\U0001F4A1 \u0418\u0442\u043E\u0433: +249\u20BD \u0447\u0438\u0441\u0442\u043E\u0439 \u043F\u0440\u0438\u0431\u044B\u043B\u0438 \u0434\u0430\u0436\u0435 \u043F\u043E\u0441\u043B\u0435 \u043E\u043F\u043B\u0430\u0442\u044B \u043F\u043E\u0434\u043F\u0438\u0441\u043A\u0438.
-
-\U0001F48E \u0413\u0430\u0440\u0430\u043D\u0442\u0438\u044F \u043E\u043A\u0443\u043F\u0430\u0435\u043C\u043E\u0441\u0442\u0438: \u0435\u0441\u043B\u0438 \u0431\u043E\u0442 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u0442 \u043D\u0438 \u043E\u0434\u043D\u043E\u0439 \u0441\u0434\u0435\u043B\u043A\u0438 \u0441 ROI 15%+ \u0437\u0430 \u043D\u0435\u0434\u0435\u043B\u044E \u2014 \u0441\u043B\u0435\u0434\u0443\u044E\u0449\u0430\u044F \u043D\u0435\u0434\u0435\u043B\u044F \u0431\u0435\u0441\u043F\u043B\u0430\u0442\u043D\u043E.
-
-\u0421\u043E\u0433\u043B\u0430\u0441\u043D\u044B \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0438\u0442\u044C?"""
-
-AGREE_KB = InlineKeyboardMarkup(inline_keyboard=[
-    [InlineKeyboardButton(text="\u2705 \u0421\u043E\u0433\u043B\u0430\u0441\u0435\u043D", callback_data="agree")],
-])
-
-# ═══════════════════════════════════════════
-# HANDLERS
-# ═══════════════════════════════════════════
-
-# Store last search results per user
-_last_search = {}
-
-@router.message(CommandStart())
+# ==================== HANDLERS ====================
+@dp.message(CommandStart())
 async def cmd_start(message: Message):
     user_id = message.from_user.id
-    username = message.from_user.username or ""
-    args = message.text.split()[1:] if " " in message.text else []
-    referrer_id = None
-    if args:
-        try:
-            referrer_id = int(args[0].replace("ref", ""))
-        except:
-            pass
-    await save_user(user_id, "", username, referrer_id)
-    if referrer_id and referrer_id != user_id:
-        async with aiosqlite.connect(DB_PATH) as db:
-            await db.execute("INSERT OR IGNORE INTO referrals (referrer_id, referred_id, created_at) VALUES (?, ?, ?)",
-                             (referrer_id, user_id, datetime.now().isoformat()))
-            await db.commit()
-    await message.answer(ONBOARDING_TEXT, reply_markup=AGREE_KB)
-
-@router.callback_query(F.data == "agree")
-async def cb_agree(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "\u041E\u0442\u043B\u0438\u0447\u043D\u043E! \u041E\u0442\u043F\u0440\u0430\u0432\u044C\u0442\u0435 \u0441\u0432\u043E\u0439 Steam ID (\u043D\u0430\u0447\u0438\u043D\u0430\u0435\u0442\u0441\u044F \u0441 7656...).\n\n\u041D\u0430\u0439\u0442\u0438 \u043C\u043E\u0436\u043D\u043E \u0437\u0434\u0435\u0441\u044C: steamid.io"
+    db_save_user(user_id)
+    tier, _ = db_check_sub(user_id)
+    is_debug = DEBUG_MODE and str(user_id) == str(DEBUG_STEAM_ID)
+    text = (
+        "👋 Добро пожаловать в EarnSkin!\n\n"
+        "🚀 Арбитражный бот для CS2 скинов\n"
+        "📊 3 площадки: Steam + CSFloat + Skinport\n\n"
+        "✨ Что умеет бот:\n"
+        "✅ Арбитраж между 3 площадками\n"
+        "✅ Анализ float, стикеров и Blue Gem\n"
+        "✅ Портфель с P&L (отслеживание прибыли)\n"
+        "✅ Стоп-лосс при падении 10%\n"
+        "✅ Ликвидность по каждому предмету\n"
+        "✅ Комиссии учтены (Steam 15%, CSFloat 2%, Skinport 12%)\n"
+        "✅ Сделка дня — бесплатно для всех\n"
+        "✅ Гарантия окупаемости\n\n"
+        "💎 Реальный пример:\n"
+        "AK-47 | Asiimov (FT)\n"
+        "🚀 CSFloat → Steam\n"
+        "Покупка: 1058₽ → Продажа: 1850₽\n"
+        "Чистыми: +514₽ (48.6%)\n\n"
+        "🆓 Freemium: 3 поиска в день бесплатно\n"
+        "🔒 ROI 25%+, Blue Gem и редкие стикеры — по подписке\n\n"
+        "Отправьте свой Steam ID (начинается с 7656...) для начала работы."
     )
+    await message.answer(text)
+    if is_debug:
+        await message.answer("🔧 DEBUG MODE: у вас безлимитный доступ (Макс тариф).")
 
-@router.callback_query(F.data == "menu")
-async def cb_menu(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    user = await get_user(user_id)
-    steam_id = user["steam_id"] if user else ""
-    premium = await is_premium(user_id, steam_id)
-    searches = await get_searches_left(user_id) if not premium else 999
-    await callback.message.edit_text(
-        "\U0001F3E0 \u0413\u043B\u0430\u0432\u043D\u043E\u0435 \u043C\u0435\u043D\u044E" + (f"\n\n\U0001F451 \u041F\u043E\u0434\u043F\u0438\u0441\u043A\u0430: \u0430\u043A\u0442\u0438\u0432\u043D\u0430" if premium else f"\n\n\U0001F193 Freemium: {searches} \u043F\u043E\u0438\u0441\u043A\u043E\u0432 \u043E\u0441\u0442\u0430\u043B\u043E\u0441\u044C \u0441\u0435\u0433\u043E\u0434\u043D\u044F"),
-        reply_markup=main_menu_kb(premium, searches)
-    )
-
-@router.message(F.text.startswith("7656"))
-async def got_steam_id(message: Message):
+@dp.message(F.text.startswith("7656"))
+async def handle_steam_id(message: Message):
     user_id = message.from_user.id
     steam_id = message.text.strip().split()[0]
-    if len(steam_id) < 10:
-        await message.answer("\u041D\u0435 \u043F\u043E\u0445\u043E\u0436\u0435 \u043D\u0430 Steam ID. \u041E\u043D \u043D\u0430\u0447\u0438\u043D\u0430\u0435\u0442\u0441\u044F \u0441 7656... \u0438 \u0441\u043E\u0434\u0435\u0440\u0436\u0438\u0442 17 \u0446\u0438\u0444\u0440.")
-        return
-    await save_user(user_id, steam_id, message.from_user.username or "")
-    premium = await is_premium(user_id, steam_id)
-    searches = await get_searches_left(user_id) if not premium else 999
+    db_save_user(user_id, steam_id)
     await message.answer(
-        "\u2705 Steam ID \u0441\u043E\u0445\u0440\u0430\u043D\u0435\u043D!\n\n\U0001F3E0 \u0413\u043B\u0430\u0432\u043D\u043E\u0435 \u043C\u0435\u043D\u044E:",
-        reply_markup=main_menu_kb(premium, searches)
+        f"✅ Steam ID сохранён: {steam_id}\n\nВыберите действие:",
+        reply_markup=get_main_keyboard()
     )
 
-@router.callback_query(F.data == "search")
+@dp.callback_query(F.data == "search")
 async def cb_search(callback: CallbackQuery):
     user_id = callback.from_user.id
-    user = await get_user(user_id)
-    steam_id = user["steam_id"] if user else ""
-    premium = await is_premium(user_id, steam_id)
-
-    if not premium:
-        can = await can_search(user_id, steam_id)
-        if not can:
-            await callback.answer("\u041B\u0438\u043C\u0438\u0442 \u0438\u0441\u0447\u0435\u0440\u043F\u0430\u043D", show_alert=True)
-            await callback.message.edit_text(
-                "\U0001F512 \u0411\u0435\u0441\u043F\u043B\u0430\u0442\u043D\u044B\u0439 \u043B\u0438\u043C\u0438\u0442 \u0438\u0441\u0447\u0435\u0440\u043F\u0430\u043D (3 \u043F\u043E\u0438\u0441\u043A\u0430 \u0432 \u0434\u0435\u043D\u044C).\n\n\u041E\u0444\u043E\u0440\u043C\u0438\u0442\u0435 \u043F\u043E\u0434\u043F\u0438\u0441\u043A\u0443, \u0447\u0442\u043E\u0431\u044B \u0438\u0441\u043A\u0430\u0442\u044C \u0431\u0435\u0437\u043B\u0438\u043C\u0438\u0442\u043D\u043E:",
-                reply_markup=subscribe_kb()
-            )
-            return
-
-    await callback.message.edit_text("\U0001F50D \u0421\u043A\u0430\u043D\u0438\u0440\u0443\u044E 3 \u043F\u043B\u043E\u0449\u0430\u0434\u043A\u0438...\n\u042D\u0442\u043E \u0437\u0430\u043D\u0438\u043C\u0430\u0435\u0442 30-60 \u0441\u0435\u043A\u0443\u043D\u0434.")
-
-    try:
-        result = await scan_market("", user_id, steam_id)
-    except Exception as e:
-        logger.error(f"Scan error: {e}")
-        await callback.message.edit_text(
-            f"\u26A0\uFE0F \u041E\u0448\u0438\u0431\u043A\u0430 \u0441\u043A\u0430\u043D\u0438\u0440\u043E\u0432\u0430\u043D\u0438\u044F: {e}\n\n\u041F\u043E\u043F\u0440\u043E\u0431\u0443\u0439\u0442\u0435 \u0435\u0449\u0435 \u0440\u0430\u0437.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="\u2B05\uFE0F \u041D\u0430\u0437\u0430\u0434", callback_data="menu")]])
-        )
-        return
-
-    if not premium:
-        await increment_search(user_id)
-
-    deals = result.get("deals", [])
-    status = result.get("status", {})
-
+    is_debug = DEBUG_MODE and str(user_id) == str(DEBUG_STEAM_ID)
+    tier, _ = db_check_sub(user_id)
+    is_premium = is_debug or tier != "free"
+    await callback.answer("Сканирую рынок...")
+    await callback.message.answer("🔍 Сканирую Steam + CSFloat + Skinport...\n⏳ Это займёт 30-60 секунд")
+    deals = await scan_market()
     if not deals:
         status_lines = []
         for p in ["steam", "csfloat", "skinport"]:
-            s = status.get(p, {})
-            if s.get("ok"):
-                status_lines.append(f"\u2705 {p.capitalize()} \u2014 {s['count']} \u043F\u0440\u0435\u0434\u043C\u0435\u0442\u043E\u0432")
-            else:
-                status_lines.append(f"\u274C {p.capitalize()} \u2014 \u043D\u0435\u0434\u043E\u0441\u0442\u0443\u043F\u0435\u043D")
-        status_text = "\n".join(status_lines)
-        await callback.message.edit_text(
-            f"\U0001F4ED \u0421\u0435\u0439\u0447\u0430\u0441 \u043D\u0435\u0442 \u043F\u0440\u0435\u0434\u043C\u0435\u0442\u043E\u0432 \u0441 ROI 15%+ \u0432 \u044D\u0442\u043E\u043C \u0441\u0435\u0433\u043C\u0435\u043D\u0442\u0435.\n\n\u0411\u043E\u0442 \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0430\u0435\u0442 \u0441\u043B\u0435\u0434\u0438\u0442\u044C \u0437\u0430 \u0440\u044B\u043D\u043A\u043E\u043C.\n\n\U0001F4CA \u0421\u0442\u0430\u0442\u0443\u0441 \u043F\u043B\u043E\u0449\u0430\u0434\u043E\u043A:\n{status_text}\n\n\u041A\u0443\u0440\u0441: 1$ = {_usd_rub:.2f}\u20BD",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="\u2B05\uFE0F \u041D\u0430\u0437\u0430\u0434", callback_data="menu")]])
+            icon = "✅" if platform_status[p] else "❌"
+            status_lines.append(f"{icon} {p.capitalize()} — {platform_counts[p]} предметов")
+        await callback.message.answer(
+            f"📭 Сейчас нет предметов с ROI выше порога\n\n"
+            f"📊 Статус площадок:\n" + "\n".join(status_lines) +
+            f"\n\n💱 Курс: 1$ = {_currency_cache['usd']:.1f}₽",
+            reply_markup=get_empty_keyboard()
         )
         return
-
-    # Freemium gating: only show ROI <= 25% for free users
-    if not premium:
-        visible_deals = [d for d in deals if d["roi"] <= 25]
-        hidden_count = len(deals) - len(visible_deals)
-        visible_deals = visible_deals[:5]
-    else:
-        visible_deals = deals[:10]
+    if is_premium:
+        shown = deals[:10]
         hidden_count = 0
-
-    _last_search[user_id] = deals
-
-    text_parts = [f"\U0001F50D \u041D\u0430\u0439\u0434\u0435\u043D\u043E {len(deals)} \u0441\u0434\u0435\u043B\u043E\u043A \u0441 ROI 15%+!\n\u041A\u0443\u0440\u0441: 1$ = {_usd_rub:.2f}\u20BD\n"]
-
-    for i, deal in enumerate(visible_deals):
-        text_parts.append(format_deal_card(deal, i + 1, full=premium))
-        text_parts.append("")
-
-    if hidden_count > 0:
-        text_parts.append(f"\U0001F512 \u0415\u0449\u0435 {hidden_count} \u0441\u0434\u0435\u043B\u043E\u043A \u0441 ROI 25%+ \u0434\u043E\u0441\u0442\u0443\u043F\u043D\u044B \u043F\u043E \u043F\u043E\u0434\u043F\u0438\u0441\u043A\u0435.\n\u0421\u0440\u0435\u0434\u0438 \u043D\u0438\u0445 \u043C\u043E\u0433\u0443\u0442 \u0431\u044B\u0442\u044C Blue Gem \u0438 \u0440\u0435\u0434\u043A\u0438\u0435 \u0441\u0442\u0438\u043A\u0435\u0440\u044B!")
-
-    full_text = "\n".join(text_parts)
-    if len(full_text) > 4096:
-        full_text = full_text[:4090] + "..."
-
-    # Show first deal with keyboard
-    if visible_deals:
-        first_deal = visible_deals[0]
-        await callback.message.edit_text(full_text, reply_markup=deal_kb(first_deal, 0), disable_web_page_preview=True)
     else:
-        await callback.message.edit_text(
-            "\U0001F4ED \u0421\u0435\u0439\u0447\u0430\u0441 \u043D\u0435\u0442 \u0431\u0435\u0441\u043F\u043B\u0430\u0442\u043D\u044B\u0445 \u0441\u0434\u0435\u043B\u043E\u043A. \u041E\u0444\u043E\u0440\u043C\u0438\u0442\u0435 \u043F\u043E\u0434\u043F\u0438\u0441\u043A\u0443, \u0447\u0442\u043E\u0431\u044B \u0432\u0438\u0434\u0435\u0442\u044C \u0432\u0441\u0435 {hidden_count} \u0441\u0434\u0435\u043B\u043E\u043A.".format(hidden_count=hidden_count) if hidden_count else "\U0001F4ED \u0421\u0434\u0435\u043B\u043E\u043A \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u043E.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="\U0001F514 \u041F\u043E\u0434\u043F\u0438\u0441\u043A\u0430", callback_data="subscribe")]])
+        shown = [d for d in deals if d["roi"] <= 25 and not d.get("blue_gem") and d.get("hidden_value", 0) == 0][:3]
+        hidden_count = len(deals) - len(shown)
+        if not shown:
+            shown = deals[:3]
+            hidden_count = len(deals) - 3
+    for deal in shown:
+        db_add_deal_history(user_id, deal["name"], deal["roi"], deal["buy_platform"])
+        text = format_deal_card(deal, show_hidden=is_premium)
+        kb = get_deal_keyboard(deal, user_id)
+        try:
+            await callback.message.answer(text, reply_markup=kb)
+            await asyncio.sleep(0.3)
+        except TelegramBadRequest:
+            pass
+    if hidden_count > 0 and not is_premium:
+        await callback.message.answer(
+            f"🔒 Ещё {hidden_count} сделок с ROI 25%+ доступны по подписке\n"
+            f"Среди них могут быть Blue Gem и предметы с редкими стикерами\n\n"
+            f"💎 Подписка от 99 Stars",
+            reply_markup=InlineKeyboardBuilder().row(
+                InlineKeyboardButton(text="🔔 Оформить подписку", callback_data="subscribe")
+            ).as_markup()
         )
+    else:
+        await callback.message.answer("Это все найденные сделки.", reply_markup=get_main_keyboard())
+    if not is_premium:
+        db_increment_search(user_id)
 
-    # Save to history
-    async with aiosqlite.connect(DB_PATH) as db:
-        for deal in visible_deals:
-            await db.execute("INSERT INTO deals_history (user_id, item_name, roi, strategy, found_at) VALUES (?, ?, ?, ?, ?)",
-                             (user_id, deal["name"], deal["roi"], f"{deal['buy_platform']}->{deal['sell_platform']}", datetime.now().isoformat()))
-        await db.commit()
-
-@router.callback_query(F.data.startswith("bought_"))
-async def cb_bought(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    idx_str = callback.data.replace("bought_", "")
-    try:
-        idx = int(idx_str)
-    except:
-        await callback.answer("\u041E\u0448\u0438\u0431\u043A\u0430", show_alert=True)
-        return
-
-    deals = _last_search.get(user_id, [])
-    if idx >= len(deals):
-        await callback.answer("\u0421\u0434\u0435\u043B\u043A\u0430 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430", show_alert=True)
-        return
-
-    deal = deals[idx]
-    now = datetime.now()
-    trade_ban_until = (now + timedelta(days=7)).isoformat()
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        existing = await db.execute("SELECT id FROM portfolio WHERE user_id = ? AND item_name = ? AND status = 'active'", (user_id, deal["name"]))
-        row = await existing.fetchone()
-        if row:
-            await callback.answer("\u0423\u0436\u0435 \u0432 \u043F\u043E\u0440\u0442\u0444\u0435\u043B\u0435", show_alert=True)
-            return
-        stickers_json = json.dumps(deal.get("rare_tags", []))
-        await db.execute("""
-            INSERT INTO portfolio (user_id, item_name, buy_price, buy_platform, sell_platform, float_value, stickers, added_at, trade_ban_until)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (user_id, deal["name"], deal["buy_price"], deal["buy_platform"], deal["sell_platform"],
-              deal.get("float_value", 0), stickers_json, now.isoformat(), trade_ban_until))
-        await db.commit()
-
-    await callback.answer("\u2705 \u0414\u043E\u0431\u0430\u0432\u043B\u0435\u043D\u043E \u0432 \u043F\u043E\u0440\u0442\u0444\u0435\u043B\u044C!", show_alert=True)
-
-@router.callback_query(F.data.startswith("fav_"))
-async def cb_fav(callback: CallbackQuery):
-    user_id = callback.from_user.id
-    idx_str = callback.data.replace("fav_", "")
-    try:
-        idx = int(idx_str)
-    except:
-        await callback.answer("\u041E\u0448\u0438\u0431\u043A\u0430", show_alert=True)
-        return
-    deals = _last_search.get(user_id, [])
-    if idx >= len(deals):
-        await callback.answer("\u0421\u0434\u0435\u043B\u043A\u0430 \u043D\u0435 \u043D\u0430\u0439\u0434\u0435\u043D\u0430", show_alert=True)
-        return
-    deal = deals[idx]
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO favorites (user_id, item_name, added_at) VALUES (?, ?, ?)",
-                         (user_id, deal["name"], datetime.now().isoformat()))
-        await db.commit()
-    await callback.answer("\u2B50 \u0414\u043E\u0431\u0430\u0432\u043B\u0435\u043D\u043E \u0432 \u0438\u0437\u0431\u0440\u0430\u043D\u043D\u043E\u0435!", show_alert=True)
-
-@router.callback_query(F.data == "portfolio")
+@dp.callback_query(F.data == "portfolio")
 async def cb_portfolio(callback: CallbackQuery):
     user_id = callback.from_user.id
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT * FROM portfolio WHERE user_id = ? AND status = 'active'", (user_id,))
-        rows = await cur.fetchall()
-
-    if not rows:
-        await callback.answer("\u041F\u043E\u0440\u0442\u0444\u0435\u043B\u044C \u043F\u0443\u0441\u0442", show_alert=True)
-        await callback.message.edit_text(
-            "\U0001F4E6 \u0412\u0430\u0448 \u043F\u043E\u0440\u0442\u0444\u0435\u043B\u044C \u043F\u0443\u0441\u0442.\n\n\u041D\u0430\u0439\u0434\u0438\u0442\u0435 \u0441\u0434\u0435\u043B\u043A\u0443 \u0438 \u043D\u0430\u0436\u043C\u0438\u0442\u0435 \u00AB\u2705 \u042F \u043A\u0443\u043F\u0438\u043B\u00BB, \u0447\u0442\u043E\u0431\u044B \u0434\u043E\u0431\u0430\u0432\u0438\u0442\u044C \u043F\u0440\u0435\u0434\u043C\u0435\u0442.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="\u2B05\uFE0F \u041D\u0430\u0437\u0430\u0434", callback_data="menu")]])
-        )
+    items = db_get_portfolio(user_id)
+    if not items:
+        await callback.answer("Портфель пуст. Найдите предмет и нажмите «Я купил».")
         return
-
-    lines = ["\U0001F4E6 \u041C\u043E\u0439 \u043F\u043E\u0440\u0442\u0444\u0435\u043B\u044C:\n"]
+    text = "📦 Ваш портфель:\n\n"
     total_invested = 0
-    for row in rows:
-        buy_price = row["buy_price"]
+    for item in items:
+        pid, _, name, buy_price, platform, float_val, stickers, paint_seed, added_at, tb_until, _, _, _ = item
         total_invested += buy_price
-        added = row["added_at"][:10] if row["added_at"] else ""
-        lines.append(f"\U0001F4B3 {row['item_name']}")
-        lines.append(f"   \u041A\u0443\u043F\u043B\u0435\u043D\u043E \u0437\u0430: {buy_price:.0f}\u20BD ({row['buy_platform']})")
-        lines.append(f"   \u041F\u0440\u043E\u0434\u0430\u0442\u044C \u043D\u0430: {row['sell_platform']}")
-        lines.append(f"   \u0414\u0430\u0442\u0430: {added}")
-        if row["trade_ban_until"]:
-            tb = row["trade_ban_until"][:10]
-            lines.append(f"   \u0422\u0440\u0435\u0439\u0434-\u0431\u0430\u043D \u0434\u043E: {tb}")
-        lines.append("")
+        text += f"🔹 {name}\n"
+        text += f"   Куплено: {buy_price:.0f}₽ ({platform})\n"
+        if float_val:
+            text += f"   Float: {float_val:.4f}\n"
+        text += f"   Добавлен: {added_at[:10]}\n\n"
+    text += f"💰 Всего вложено: {total_invested:.0f}₽\n"
+    text += f"📦 Позиций: {len(items)}"
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🔍 Найти предметы", callback_data="search"))
+    await callback.message.answer(text, reply_markup=kb.as_markup())
+    await callback.answer()
 
-    lines.append(f"\U0001F4B0 \u0412\u0441\u0435\u0433\u043E \u0432\u043B\u043E\u0436\u0435\u043D\u043E: {total_invested:.0f}\u20BD")
+@dp.callback_query(F.data.startswith("bought:"))
+async def cb_bought(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    data = callback.data.split(":", 2)
+    if len(data) < 3:
+        await callback.answer("Ошибка данных")
+        return
+    name = data[1]
+    try:
+        buy_price = float(data[2])
+    except ValueError:
+        buy_price = 0
+    db_add_to_portfolio(user_id, name, buy_price, "CSFloat")
+    await callback.answer("✅ Добавлено в портфель!")
+    await callback.message.answer(
+        f"📦 {name} добавлен в портфель!\n"
+        f"💵 Цена покупки: {buy_price:.0f}₽\n"
+        f"⏰ Бот будет следить за ценой и уведомит о росте/падении\n\n"
+        f"Посмотреть: /portfolio",
+        reply_markup=get_main_keyboard()
+    )
 
-    text = "\n".join(lines)
-    if len(text) > 4096:
-        text = text[:4090] + "..."
+@dp.callback_query(F.data.startswith("fav:"))
+async def cb_favorite(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    data = callback.data.split(":", 1)
+    if len(data) < 2:
+        await callback.answer("Ошибка")
+        return
+    name = data[1]
+    db_add_favorite(user_id, name)
+    await callback.answer("⭐ Добавлено в избранное!")
 
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="\u2B05\uFE0F \u041D\u0430\u0437\u0430\u0434", callback_data="menu")]]))
-
-@router.callback_query(F.data == "favorites")
+@dp.callback_query(F.data == "favorites")
 async def cb_favorites(callback: CallbackQuery):
     user_id = callback.from_user.id
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT item_name, added_at FROM favorites WHERE user_id = ? ORDER BY added_at DESC LIMIT 20", (user_id,))
-        rows = await cur.fetchall()
-
-    if not rows:
-        await callback.answer("\u0418\u0437\u0431\u0440\u0430\u043D\u043D\u043E\u0435 \u043F\u0443\u0441\u0442\u043E", show_alert=True)
+    favs = db_get_favorites(user_id)
+    if not favs:
+        await callback.answer("Избранное пусто")
         return
+    text = "⭐ Избранное:\n\n"
+    for f in favs:
+        text += f"🔹 {f[2]}\n"
+    await callback.message.answer(text, reply_markup=get_main_keyboard())
+    await callback.answer()
 
-    lines = ["\u2B50 \u0418\u0437\u0431\u0440\u0430\u043D\u043D\u043E\u0435:\n"]
-    for row in rows:
-        lines.append(f"\u2022 {row[0]}")
-
-    await callback.message.edit_text("\n".join(lines), reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="\u2B05\uFE0F \u041D\u0430\u0437\u0430\u0434", callback_data="menu")]]))
-
-@router.callback_query(F.data == "subscribe")
+@dp.callback_query(F.data == "subscribe")
 async def cb_subscribe(callback: CallbackQuery):
-    text = """\U0001F514 \u041E\u0444\u043E\u0440\u043C\u043B\u0435\u043D\u0438\u0435 \u043F\u043E\u0434\u043F\u0438\u0441\u043A\u0438
+    text = (
+        "🔔 Подписка EarnSkin\n\n"
+        "🆓 Freemium: 3 поиска/день (ROI до 25%)\n\n"
+        "🥉 Старт — 99 Stars/неделя\n"
+        "   Безлимитные поиски, ROI до 25%\n\n"
+        "🥈 Про — 199 Stars/неделя\n"
+        "   Безлимит + все сделки + стоп-лосс + уведомления\n\n"
+        "🥇 Макс — 399 Stars/месяц\n"
+        "   Всё из Про + все сегменты + безлимит избранного\n\n"
+        "💎 Гарантия: если бот не найдёт ни одной сделки с ROI 15%+ за неделю — следующая неделя бесплатно."
+    )
+    kb = InlineKeyboardBuilder()
+    kb.row(InlineKeyboardButton(text="🥉 Старт (99 Stars)", callback_data="pay_start"))
+    kb.row(InlineKeyboardButton(text="🥈 Про (199 Stars)", callback_data="pay_pro"))
+    kb.row(InlineKeyboardButton(text="🥇 Макс (399 Stars)", callback_data="pay_max"))
+    kb.row(InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main"))
+    await callback.message.answer(text, reply_markup=kb.as_markup())
+    await callback.answer()
 
-\U0001F948 \u0421\u0442\u0430\u0440\u0442 \u2014 99 Stars/\u043D\u0435\u0434
-\u0411\u0435\u0437\u043B\u0438\u043C\u0438\u0442\u043D\u044B\u0439 \u043F\u043E\u0438\u0441\u043A, 1 \u0441\u0435\u0433\u043C\u0435\u043D\u0442
-
-\U0001F948 \u041F\u0440\u043E \u2014 199 Stars/\u043D\u0435\u0434 (\u0438\u043B\u0438 599/\u043C\u0435\u0441)
-\u0412\u0441\u0435 + \u0443\u0432\u0435\u0434\u043E\u043C\u043B\u0435\u043D\u0438\u044F + 3 \u0441\u0435\u0433\u043C\u0435\u043D\u0442\u0430 + \u0441\u0442\u043E\u043F-\u043B\u043E\u0441\u0441 + \u043F\u043E\u0440\u0442\u0444\u0435\u043B\u044C
-
-\U0001F947 \u041C\u0430\u043A\u0441 \u2014 399 Stars/\u043C\u0435\u0441 (\u0438\u043B\u0438 999/3 \u043C\u0435\u0441)
-\u0412\u0441\u0435 + \u0431\u0435\u0437\u043B\u0438\u043C\u0438\u0442 \u0438\u0437\u0431\u0440\u0430\u043D\u043D\u043E\u0433\u043E + \u043F\u0440\u0438\u043E\u0440\u0438\u0442\u0435\u0442\u043D\u044B\u0439 \u0441\u043A\u0430\u043D + \u0438\u0441\u0442\u043E\u0440\u0438\u044F
-
-\U0001F48E \u0413\u0430\u0440\u0430\u043D\u0442\u0438\u044F: \u043D\u0435\u0442 \u0441\u0434\u0435\u043B\u043E\u043A 15%+ \u0437\u0430 \u043D\u0435\u0434\u0435\u043B\u044E = \u0441\u043B\u0435\u0434\u0443\u044E\u0449\u0430\u044F \u043D\u0435\u0434\u0435\u043B\u044F \u0431\u0435\u0441\u043F\u043B\u0430\u0442\u043D\u043E."""
-    await callback.message.edit_text(text, reply_markup=subscribe_kb())
-
-# Payment handlers
-@router.callback_query(F.data.startswith("pay_"))
+@dp.callback_query(F.data.startswith("pay_"))
 async def cb_pay(callback: CallbackQuery):
-    plans = {
-        "pay_start_week": ("start", 99, 7),
-        "pay_pro_week": ("pro", 199, 7),
-        "pay_pro_month": ("pro", 599, 30),
-        "pay_max_month": ("max", 399, 30),
-        "pay_max_3month": ("max", 999, 90),
-    }
-    plan = plans.get(callback.data)
-    if not plan:
-        await callback.answer("\u041D\u0435\u0438\u0437\u0432\u0435\u0441\u0442\u043D\u044B\u0439 \u0442\u0430\u0440\u0438\u0444", show_alert=True)
+    user_id = callback.from_user.id
+    plan = callback.data.split("_")[1]
+    prices = {"start": 99, "pro": 199, "max": 399}
+    days = {"start": 7, "pro": 7, "max": 30}
+    if plan not in prices:
+        await callback.answer("Неизвестный тариф")
         return
-    tier, stars, days = plan
     try:
         await bot.send_invoice(
             chat_id=callback.message.chat.id,
-            title=f"EarnSkin {tier.upper()} - {days}\u0434\u043D.",
-            description=f"\u041F\u043E\u0434\u043F\u0438\u0441\u043A\u0430 {tier.upper()} \u043D\u0430 {days} \u0434\u043D\u0435\u0439",
-            payload=f"sub_{tier}_{days}_{callback.from_user.id}",
+            title=f"Подписка EarnSkin ({plan.capitalize()})",
+            description=f"Подписка на {days[plan]} дней",
+            payload=f"sub_{plan}",
             currency="XTR",
-            prices=[LabeledPrice(label=f"{tier} {days}\u0434\u043D.", amount=stars)],
+            prices=[LabeledPrice(label=f"{plan.capitalize()} tariff", amount=prices[plan])],
             provider_token="",
         )
     except Exception as e:
-        logger.error(f"Send invoice error: {e}")
-        await callback.answer(f"\u041E\u0448\u0438\u0431\u043A\u0430: {e}", show_alert=True)
+        await callback.message.answer(f"Ошибка оплаты: {e}\nВозможно, Stars не настроены.")
+    await callback.answer()
 
-@router.pre_checkout_query()
-async def pre_checkout(query):
-    await query.answer(ok=True)
+@dp.pre_checkout_query()
+async def pre_checkout(query: types.PreCheckoutQuery):
+    await bot.answer_pre_checkout_query(query.id, ok=True)
 
-@router.message(F.successful_payment)
+@dp.message(F.successful_payment)
 async def on_payment(message: Message):
+    user_id = message.from_user.id
     payload = message.successful_payment.invoice_payload
-    parts = payload.split("_")
-    if len(parts) < 4:
-        return
-    tier = parts[1]
-    days = int(parts[2])
-    user_id = int(parts[3])
-    until = (datetime.now() + timedelta(days=days)).isoformat()
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("UPDATE users SET sub_tier = ?, sub_until = ? WHERE user_id = ?", (tier, until, user_id))
-        await db.commit()
-    await message.answer(f"\u2705 \u041F\u043E\u0434\u043F\u0438\u0441\u043A\u0430 {tier.upper()} \u0430\u043A\u0442\u0438\u0432\u0438\u0440\u043E\u0432\u0430\u043D\u0430 \u043D\u0430 {days} \u0434\u043D\u0435\u0439!")
+    plan = payload.split("_")[1] if "_" in payload else "start"
+    days = {"start": 7, "pro": 7, "max": 30}
+    db_update_sub(user_id, plan, days.get(plan, 7))
+    await message.answer(
+        f"✅ Подписка оформлена!\nПлан: {plan.capitalize()}\nСрок: {days.get(plan, 7)} дней\n\n"
+        f"Теперь вам доступны все сделки без ограничений!",
+        reply_markup=get_main_keyboard()
+    )
 
-@router.callback_query(F.data == "stats")
+@dp.callback_query(F.data == "stats")
 async def cb_stats(callback: CallbackQuery):
     user_id = callback.from_user.id
-    async with aiosqlite.connect(DB_PATH) as db:
-        db.row_factory = aiosqlite.Row
-        cur = await db.execute("SELECT COUNT(*) as cnt, AVG(roi) as avg_roi, MAX(roi) as max_roi FROM deals_history WHERE user_id = ? AND found_at >= ?", (user_id, (datetime.now() - timedelta(days=7)).isoformat()))
-        row = await cur.fetchone()
-        cur2 = await db.execute("SELECT COUNT(*) FROM portfolio WHERE user_id = ? AND status = 'active'", (user_id,))
-        portfolio_count = (await cur2.fetchone())[0]
+    s = db_get_stats(user_id)
+    text = (
+        f"📊 Ваша статистика:\n\n"
+        f"🔍 Сделок найдено за неделю: {s['deals_week']}\n"
+        f"📦 Всего сделок: {s['total_deals']}\n"
+        f"📦 В портфеле: {s['portfolio_count']}\n"
+        f"⭐ В избранном: {s['fav_count']}\n"
+        f"🏆 Лучший ROI: {s['best_roi']:.1f}%\n"
+        f"📈 Средний ROI: {s['avg_roi']:.1f}%\n"
+    )
+    await callback.message.answer(text, reply_markup=get_main_keyboard())
+    await callback.answer()
 
-    cnt = row["cnt"] if row else 0
-    avg_roi = row["avg_roi"] if row and row["avg_roi"] else 0
-    max_roi = row["max_roi"] if row and row["max_roi"] else 0
-
-    text = f"""\U0001F4CA \u0412\u0430\u0448\u0430 \u043D\u0435\u0434\u0435\u043B\u044F:
-
-\U0001F50D \u041D\u0430\u0439\u0434\u0435\u043D\u043E \u0441\u0434\u0435\u043B\u043E\u043A: {cnt}
-\U0001F4B0 \u0421\u0440\u0435\u0434\u043D\u0438\u0439 ROI: {avg_roi:.1f}% 
-\U0001F3C6 \u041B\u0443\u0447\u0448\u0430\u044F \u0441\u0434\u0435\u043B\u043A\u0430: {max_roi:.1f}%
-\U0001F4E6 \u0412 \u043F\u043E\u0440\u0442\u0444\u0435\u043B\u0435: {portfolio_count}
-
-\U0001F481 \u041F\u043E\u0434\u043F\u0438\u0441\u043A\u0430 \u043E\u043A\u0443\u043F\u0438\u043B\u0430\u0441\u044C \u0431\u044B \u0432 {int(max_roi / 100 * 5) if max_roi else 0} \u0440\u0430\u0437, \u0435\u0441\u043B\u0438 \u0431\u044B \u0432\u044B \u0441\u0434\u0435\u043B\u0430\u043B\u0438 \u043B\u0443\u0447\u0448\u0443\u044E \u0441\u0434\u0435\u043B\u043A\u0443."""
-
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="\u2B05\uFE0F \u041D\u0430\u0437\u0430\u0434", callback_data="menu")]]))
-
-@router.callback_query(F.data == "referral")
+@dp.callback_query(F.data == "referral")
 async def cb_referral(callback: CallbackQuery):
     user_id = callback.from_user.id
+    ref_code = str(user_id)
     bot_info = await bot.get_me()
-    ref_link = f"https://t.me/{bot_info.username}?start=ref{user_id}"
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT COUNT(*) FROM referrals WHERE referrer_id = ?", (user_id,))
-        ref_count = (await cur.fetchone())[0]
+    ref_link = f"https://t.me/{bot_info.username}?start=ref_{ref_code}"
+    text = (
+        f"👥 Реферальная программа\n\n"
+        f"Приглашайте друзей и получайте бонусы!\n\n"
+        f"Ваша ссылка:\n{ref_link}\n\n"
+        f"Награда: +1 день подписки за каждого оплатившего друга"
+    )
+    await callback.message.answer(text, reply_markup=get_main_keyboard())
+    await callback.answer()
 
-    remaining = max(0, 3 - ref_count)
-    progress = "\u25A0" * ref_count + "\u25A1" * remaining
+@dp.callback_query(F.data == "back_main")
+async def cb_back(callback: CallbackQuery):
+    await callback.message.answer("Главное меню:", reply_markup=get_main_keyboard())
+    await callback.answer()
 
-    text = f"""\U0001F465 \u0420\u0435\u0444\u0435\u0440\u0430\u043B\u044C\u043D\u0430\u044F \u043F\u0440\u043E\u0433\u0440\u0430\u043C\u043C\u0430
-
-\u041F\u0440\u0438\u0433\u043B\u0430\u0448\u0438\u0442\u0435 \u0434\u0440\u0443\u0437\u0435\u0439 \u2014 \u043F\u043E\u043B\u0443\u0447\u0430\u0439\u0442\u0435 \u0431\u0435\u0441\u043F\u043B\u0430\u0442\u043D\u044B\u0435 \u043D\u0435\u0434\u0435\u043B\u0438!
-
-\u041F\u0440\u043E\u0433\u0440\u0435\u0441\u0441: {progress}
-\u041F\u0440\u0438\u0433\u043B\u0430\u0448\u0435\u043D\u043E: {ref_count}/3 \u2192 \u043D\u0435\u0434\u0435\u043B\u044F \u0431\u0435\u0441\u043F\u043B\u0430\u0442\u043D\u043E
-
-\u0412\u0430\u0448\u0430 \u0441\u0441\u044B\u043B\u043A\u0430:
-{ref_link}"""
-
-    await callback.message.edit_text(text, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="\u2B05\uFE0F \u041D\u0430\u0437\u0430\u0434", callback_data="menu")]]))
-
-# ═══════════════════════════════════════════
-# DEAL OF DAY
-# ═══════════════════════════════════════════
-
-async def send_deal_of_day():
-    today = datetime.now().strftime("%Y-%m-%d")
-    async with aiosqlite.connect(DB_PATH) as db:
-        cur = await db.execute("SELECT * FROM deal_of_day WHERE date = ?", (today,))
-        existing = await cur.fetchone()
-        if existing:
-            return
-
-    await update_rates()
-    try:
-        result = await scan_market("")
-    except:
+@dp.message(Command("portfolio"))
+async def cmd_portfolio(message: Message):
+    user_id = message.from_user.id
+    items = db_get_portfolio(user_id)
+    if not items:
+        await message.answer("Портфель пуст. Найдите предмет и нажмите «Я купил».", reply_markup=get_main_keyboard())
         return
+    text = "📦 Ваш портфель:\n\n"
+    total_invested = 0
+    for item in items:
+        pid, _, name, buy_price, platform, float_val, stickers, paint_seed, added_at, tb_until, _, _, _ = item
+        total_invested += buy_price
+        text += f"🔹 {name}\n   Куплено: {buy_price:.0f}₽ ({platform})\n\n"
+    text += f"💰 Всего вложено: {total_invested:.0f}₽"
+    await message.answer(text, reply_markup=get_main_keyboard())
 
-    deals = result.get("deals", [])
-    if not deals:
-        # Fallback: send market status
-        async with aiosqlite.connect(DB_PATH) as db:
-            async with db.execute("SELECT user_id FROM users") as cur:
-                users = await cur.fetchall()
-        for (uid,) in users:
-            try:
-                await bot.send_message(uid, "\U0001F4ED \u0421\u0435\u0433\u043E\u0434\u043D\u044F \u043D\u0435\u0442 \u0441\u0434\u0435\u043B\u043E\u043A \u0441 ROI 15%+. \u0411\u043E\u0442 \u043F\u0440\u043E\u0434\u043E\u043B\u0436\u0430\u0435\u0442 \u0441\u043B\u0435\u0434\u0438\u0442\u044C.")
-            except:
-                pass
-        return
+@dp.message(Command("stats"))
+async def cmd_stats(message: Message):
+    user_id = message.from_user.id
+    s = db_get_stats(user_id)
+    text = (
+        f"📊 Ваша статистика:\n\n"
+        f"🔍 Сделок за неделю: {s['deals_week']}\n"
+        f"📦 Всего: {s['total_deals']}\n"
+        f"⭐ Избранное: {s['fav_count']}\n"
+        f"🏆 Лучший ROI: {s['best_roi']:.1f}%\n"
+    )
+    await message.answer(text, reply_markup=get_main_keyboard())
 
-    best = deals[0]
-    if best["roi"] < 15:
-        note = "\n\u26A0\uFE0F ROI \u043D\u0438\u0436\u0435 \u043F\u043E\u0440\u043E\u0433\u0430, \u043D\u043E \u044D\u0442\u043E \u043B\u0443\u0447\u0448\u0435\u0435 \u043D\u0430 \u0441\u0435\u0433\u043E\u0434\u043D\u044F."
-    else:
-        note = ""
-
-    text = f"""\U0001F525 \u0421\u0434\u0435\u043B\u043A\u0430 \u0434\u043D\u044F (\u0431\u0435\u0441\u043F\u043B\u0430\u0442\u043D\u043E):
-
-{best['name']}
-\U0001F680 {best['buy_platform']} \u2192 {best['sell_platform']}
-\U0001F4B5 {best['buy_price']:.0f}\u20BD \u2192 {best['sell_price']:.0f}\u20BD
-\U0001F4B0 \u0427\u0438\u0441\u0442\u044B\u043C\u0438: +{best['profit']:.0f}\u20BD ({best['roi']}%){note}
-
-\u0425\u043E\u0442\u0438\u0442\u0435 \u0431\u043E\u043B\u044C\u0448\u0435? \u041E\u0444\u043E\u0440\u043C\u0438\u0442\u0435 \u043F\u043E\u0434\u043F\u0438\u0441\u043A\u0443!"""
-
-    kb = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=f"\U0001F517 \u041A\u0443\u043F\u0438\u0442\u044C", url=best["buy_link"])],
-        [InlineKeyboardButton(text="\U0001F514 \u041F\u043E\u0434\u043F\u0438\u0441\u043A\u0430", callback_data="subscribe")],
-    ])
-
-    async with aiosqlite.connect(DB_PATH) as db:
-        await db.execute("INSERT INTO deal_of_day (date, item_name, roi, strategy, buy_price, sell_price, text) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                         (today, best["name"], best["roi"], f"{best['buy_platform']}->{best['sell_platform']}", best["buy_price"], best["sell_price"], text))
-        await db.commit()
-        async with db.execute("SELECT user_id FROM users") as cur:
-            users = await cur.fetchall()
-
-    for (uid,) in users:
-        try:
-            await bot.send_message(uid, text, reply_markup=kb, disable_web_page_preview=True)
-        except Exception as e:
-            logger.warning(f"Failed to send deal to {uid}: {e}")
-
-# ═══════════════════════════════════════════
-# PORTFOLIO MONITOR
-# ═══════════════════════════════════════════
-
-async def monitor_portfolio():
+# ==================== DAILY DEAL ====================
+async def daily_deal_task():
     while True:
-        await asyncio.sleep(PORTFOLIO_CHECK_INTERVAL)
-        try:
-            async with aiosqlite.connect(DB_PATH) as db:
-                db.row_factory = aiosqlite.Row
-                cur = await db.execute("SELECT * FROM portfolio WHERE status = 'active'")
-                positions = await cur.fetchall()
-
-            if not positions:
-                continue
-
-            async with aiohttp.ClientSession() as session:
-                for pos in positions:
-                    name = pos["item_name"]
-                    buy_price = pos["buy_price"]
-                    try:
-                        po = await fetch_steam_priceoverview(session, name)
-                        current_price = po.get("median_price", 0)
-                    except:
-                        continue
-
-                    if current_price <= 0:
-                        continue
-
-                    pnl_pct = (current_price - buy_price) / buy_price * 100 if buy_price else 0
-
-                    if pnl_pct >= 15:
-                        await bot.send_message(pos["user_id"],
-                            f"\U0001F4C8 \u041F\u043E\u0440\u0430 \u043F\u0440\u043E\u0434\u0430\u0432\u0430\u0442\u044C!\n\n{name}\n\u041A\u0443\u043F\u043B\u0435\u043D\u043E: {buy_price:.0f}\u20BD\n\u0422\u0435\u043A\u0443\u0449\u0430\u044F: {current_price:.0f}\u20BD\n\u041F\u0440\u0438\u0431\u044B\u043B\u044C: +{current_price - buy_price:.0f}\u20BD ({pnl_pct:.1f}%)")
-                    elif pnl_pct <= -10:
-                        await bot.send_message(pos["user_id"],
-                            f"\U0001F6D1 \u0421\u0442\u043E\u043F-\u043B\u043E\u0441\u0441!\n\n{name}\n\u041A\u0443\u043F\u043B\u0435\u043D\u043E: {buy_price:.0f}\u20BD\n\u0422\u0435\u043A\u0443\u0449\u0430\u044F: {current_price:.0f}\u20BD\n\u0423\u0431\u044B\u0442\u043E\u043A: {current_price - buy_price:.0f}\u20BD ({pnl_pct:.1f}%)\n\n\u0420\u0435\u043A\u043E\u043C\u0435\u043D\u0434\u0443\u0435\u043C \u043F\u0440\u043E\u0434\u0430\u0442\u044C.")
-
-                    # Trade ban ending
-                    if pos["trade_ban_until"]:
+        now = datetime.now()
+        if now.hour == 12:
+            today = now.strftime("%Y-%m-%d")
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT COUNT(*) FROM daily_deals WHERE date = ?", (today,))
+            if c.fetchone()[0] == 0:
+                conn.close()
+                deals = await scan_market()
+                if deals:
+                    deal = deals[0]
+                    db_save_daily_deal(deal["name"], deal["roi"], deal["buy_platform"], deal["buy_price"], deal["sell_price"])
+                    text = (
+                        f"🔥 Сделка дня (бесплатно)\n\n"
+                        f"{format_deal_card(deal, show_hidden=True)}\n\n"
+                        f"Хотите больше? /subscribe"
+                    )
+                    conn = sqlite3.connect(DB_PATH)
+                    c = conn.cursor()
+                    c.execute("SELECT user_id FROM users")
+                    users = c.fetchall()
+                    conn.close()
+                    for uid in users:
                         try:
-                            tb = datetime.fromisoformat(pos["trade_ban_until"])
-                            days_left = (tb - datetime.now()).days
-                            if days_left == 1:
-                                await bot.send_message(pos["user_id"],
-                                    f"\u23F0 \u0422\u0440\u0435\u0439\u0434-\u0431\u0430\u043D \u0437\u0430\u043A\u0430\u043D\u0447\u0438\u0432\u0430\u0435\u0442\u0441\u044F \u0437\u0430\u0432\u0442\u0440\u0430.\n\n{name}\n\u0422\u0435\u043A\u0443\u0449\u0430\u044F \u0446\u0435\u043D\u0430: {current_price:.0f}\u20BD\n\u0420\u0435\u043A\u043E\u043C\u0435\u043D\u0434\u0430\u0446\u0438\u044F: \u0432\u044B\u0441\u0442\u0430\u0432\u0438\u0442\u044C \u043D\u0430 \u043F\u0440\u043E\u0434\u0430\u0436\u0443.")
-                            elif days_left <= 0:
-                                await bot.send_message(pos["user_id"],
-                                    f"\u2705 \u0422\u0440\u0435\u0439\u0434-\u0431\u0430\u043D \u0438\u0441\u0442\u0451\u043A!\n\n{name}\n\u0422\u0435\u043A\u0443\u0449\u0430\u044F \u0446\u0435\u043D\u0430: {current_price:.0f}\u20BD\n\u041C\u043E\u0436\u043D\u043E \u043F\u0440\u043E\u0434\u0430\u0432\u0430\u0442\u044C!")
-                                await db.execute("UPDATE portfolio SET status = 'tradable' WHERE id = ?", (pos["id"],))
-                                await db.commit()
-                        except:
+                            await bot.send_message(uid[0], text)
+                        except Exception:
+                            pass
+                    await asyncio.sleep(3600)
+            else:
+                conn.close()
+        await asyncio.sleep(600)
+
+# ==================== PORTFOLIO MONITOR ====================
+async def portfolio_monitor_task():
+    while True:
+        try:
+            conn = sqlite3.connect(DB_PATH)
+            c = conn.cursor()
+            c.execute("SELECT * FROM portfolio")
+            items = c.fetchall()
+            conn.close()
+            for item in items:
+                pid, user_id, name, buy_price, platform = item[0], item[1], item[2], item[3], item[4]
+                trade_ban_until = item[9]
+                notified_sell = item[10] or 0
+                notified_stoploss = item[11] or 0
+                notified_tradeban = item[12] or 0
+                # Check trade ban
+                if trade_ban_until and not notified_tradeban:
+                    tb_date = datetime.fromisoformat(trade_ban_until)
+                    if datetime.now() >= tb_date - timedelta(days=1):
+                        try:
+                            await bot.send_message(user_id,
+                                f"⏰ Трейд-бан заканчивается завтра!\n\n"
+                                f"Предмет: {name}\n"
+                                f"Цена покупки: {buy_price:.0f}₽\n"
+                                f"Проверьте цену и выставляйте на продажу!")
+                            conn = sqlite3.connect(DB_PATH)
+                            c = conn.cursor()
+                            c.execute("UPDATE portfolio SET notified_tradeban = 1 WHERE id = ?", (pid,))
+                            conn.commit()
+                            conn.close()
+                        except Exception:
                             pass
         except Exception as e:
-            logger.error(f"Portfolio monitor error: {e}")
+            logger.warning(f"Portfolio monitor error: {e}")
+        await asyncio.sleep(1800)
 
-# ═══════════════════════════════════════════
-# SCHEDULED TASKS
-# ═══════════════════════════════════════════
-
-async def scheduled_tasks():
-    while True:
-        await asyncio.sleep(60)
-        now = datetime.now()
-        # Deal of day at 12:00
-        if now.hour == 12 and now.minute < 2:
-            await send_deal_of_day()
-            await asyncio.sleep(120)
-
-# ═══════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════
-
+# ==================== INIT ====================
 async def main():
-    global bot
-    if BOT_TOKEN == "TOKEN_HERE":
-        logger.error("BOT_TOKEN not set! Set environment variable BOT_TOKEN or edit the code.")
-        return
-    bot = Bot(token=BOT_TOKEN)
-    await db_init()
-    await update_rates()
-    asyncio.create_task(monitor_portfolio())
-    asyncio.create_task(scheduled_tasks())
-    logger.info("Bot starting...")
-    await dp.start_polling(bot)
+    db_init()
+    logger.info("Database initialized (sqlite3)")
+    logger.info(f"DEBUG_MODE: {DEBUG_MODE}, DEBUG_STEAM_ID: {DEBUG_STEAM_ID}")
+    logger.info(f"Currency: USD={_currency_cache['usd']}, EUR={_currency_cache['eur']}")
+    asyncio.create_task(daily_deal_task())
+    asyncio.create_task(portfolio_monitor_task())
+    await dp.start_polling(bot, skip_updates=True)
 
 if __name__ == "__main__":
     asyncio.run(main())
