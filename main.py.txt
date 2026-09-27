@@ -1,1829 +1,1349 @@
+
 # ============================================================
-# EarnSkin Bot v2.0 — Full Product (10/10)
+# EarnSkin v6.0 — Sniper Edition
+# Арбитраж + оценка стикеров + float-премиум + Blue Gem
 # ============================================================
 
 import os
-import re
+import asyncio
+import aiosqlite
+import logging
 import json
 import time
-import html
-import sqlite3
-import logging
-import signal
-import asyncio
+import math
+import re
+import urllib.parse
 from datetime import datetime, timedelta
-from typing import Optional
 
+from aiogram import Bot, Dispatcher, F, Router
+from aiogram.types import (
+    Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton,
+    LabeledPrice, BufferedInputFile
+)
+from aiogram.filters import CommandStart, Command
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+from aiogram.exceptions import TelegramRetryAfter
 import aiohttp
-from telegram import (
-    Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    LabeledPrice,
-    WebAppInfo,
-)
-from telegram.ext import (
-    ApplicationBuilder,
-    CommandHandler,
-    CallbackQueryHandler,
-    MessageHandler,
-    PreCheckoutQueryHandler,
-    ContextTypes,
-    filters,
-)
-from telegram.constants import ParseMode
 
-# ─── CONFIG ───────────────────────────────────────────────────
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "8891544206:AAGHEi8azq08GcnzRZIooO9QcEXTy-0Mftg")
-ADMIN_IDS = [8891544206]
+# ============================================================
+# КОНФИГУРАЦИЯ
+# ============================================================
 
-GAMES = {
-    "cs2":    {"name": "CS2",    "appid": 730},
-    "dota2":  {"name": "Dota 2", "appid": 570},
-    "rust":   {"name": "Rust",   "appid": 252490},
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "TOKEN_HERE")
+USD_RUB_FALLBACK = 92.0
+EUR_RUB_FALLBACK = 100.0
+STEAM_COMMISSION = 0.15
+CSFLOAT_COMMISSION = 0.02
+SKINPORT_COMMISSION = 0.12
+MIN_ROI_THRESHOLD = 0.15
+SCAN_INTERVAL = 30
+SCAN_CACHE_TTL = 120
+MAX_CONCURRENT_SCANS = 2
+MAX_LISTINGS_PER_PAGE = 100
+MAX_PAGES = 15
+TRIAL_DURATION_HOURS = 24
+STOPLoss_THRESHOLD = 0.10
+STOPLoss_CHECK_INTERVAL = 1800
+DEAL_OF_THE_DAY_HOUR = 12
+FREEMIUM_DAILY_LIMIT = 3
+FREEMIUM_REMIND_DAY = 4
+SCAN_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_SCANS)
+
+# ============================================================
+# РЕДКИЕ СТИКЕРЫ
+# ============================================================
+
+RARE_STICKERS = {
+    "katowice 2014": {"multiplier": 50, "tag": "Katowice 2014", "min_value": 5000},
+    "katowice 2015": {"multiplier": 15, "tag": "Katowice 2015", "min_value": 1500},
+    "crown foil": {"multiplier": 20, "tag": "Crown (Foil)", "min_value": 2000},
+    "howling dawn": {"multiplier": 40, "tag": "Howling Dawn", "min_value": 8000},
+    "ibp holo": {"multiplier": 30, "tag": "iBP Holo", "min_value": 4000},
+    "ibuypower holo": {"multiplier": 30, "tag": "iBP Holo", "min_value": 4000},
+    "titan holo": {"multiplier": 25, "tag": "Titan Holo", "min_value": 3000},
+    "complexity holo": {"multiplier": 20, "tag": "Complexity Holo", "min_value": 2000},
+    "lgb holo": {"multiplier": 18, "tag": "LGB Holo", "min_value": 1500},
+    "reason holo": {"multiplier": 15, "tag": "Reason Holo", "min_value": 1200},
+    "crown": {"multiplier": 8, "tag": "Crown", "min_value": 500},
+    "dragon lore": {"multiplier": 10, "tag": "Dragon Lore", "min_value": 800},
 }
 
-SEGMENTS = {
-    "seg_1": {"label": "До 500 ₽",      "min": 0,      "max": 500},
-    "seg_2": {"label": "500–2 000 ₽",    "min": 500,    "max": 2000},
-    "seg_3": {"label": "2 000–5 000 ₽", "min": 2000,   "max": 5000},
-    "seg_4": {"label": "5 000 ₽+",      "min": 5000,   "max": 999999},
+# ============================================================
+# BLUE GEM ПАТТЕРНЫ
+# ============================================================
+
+BLUE_GEM_TIER1 = {661, 563, 321}
+BLUE_GEM_TIER2 = {292, 600, 643, 414, 406, 385, 561, 630, 645}
+BLUE_GEM_TIER3 = {482, 510, 595, 644, 471, 500, 322, 177}
+
+BLUE_GEM_TIERS = {
+    "tier1": {"multiplier": 10.0, "tag": "Blue Gem Tier 1"},
+    "tier2": {"multiplier": 5.0, "tag": "Blue Gem Tier 2"},
+    "tier3": {"multiplier": 2.5, "tag": "Blue Gem Tier 3"},
 }
 
-SUB_PLANS = {
-    "sub_7":   {"days": 7,   "stars": 150,  "label": "7 дней"},
-    "sub_30":  {"days": 30,  "stars": 500,  "label": "30 дней"},
-    "sub_90":  {"days": 90,  "stars": 1200, "label": "90 дней"},
+# ============================================================
+# FLOAT ДИАПАЗОНЫ
+# ============================================================
+
+WEAR_RANGES = {
+    "Factory New": (0.0, 0.07),
+    "Minimal Wear": (0.07, 0.15),
+    "Field-Tested": (0.15, 0.38),
+    "Well-Worn": (0.38, 0.45),
+    "Battle-Scarred": (0.45, 1.0),
 }
 
-# Referral config
-REF_BONUS_HOURS = 24            # +1 день обоим
-REF_MAX_BONUS_PER_MONTH = 10    # максимум 10 бонусных дней в месяц
-TRIAL_HOURS = 24                # базовый триал
+# ============================================================
+# ЛОГГИРОВАНИЕ
+# ============================================================
 
-# Market check interval (seconds)
-MARKET_CHECK_INTERVAL = 120     # 2 минуты
-PRICE_CHECK_INTERVAL = 3600     # 1 час для авто-продажи
-NOTIFY_COOLDOWN = 86400         # 24 часа — не повторять один предмет
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger(__name__)
 
-# Rate limiting
-RATE_LIMIT_PER_MIN = 10         # максимум команд в минуту от юзера
+# ============================================================
+# ИНИЦИАЛИЗАЦИЯ
+# ============================================================
 
-# Cache
-CACHE_TTL = 60                  # 60 секунд кэш Steam
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher()
+router = Router()
+dp.include_router(router)
 
-# DB
-DB_FILE = "earnskin.db"
+DB_PATH = "earnskin.db"
 
-# Logging
-logging.basicConfig(
-    format="%(asctime)s — %(name)s — %(levelname)s — %(message)s",
-    level=logging.INFO,
-)
-logger = logging.getLogger("EarnSkin")
+# ============================================================
+# БАЗА ДАННЫХ
+# ============================================================
 
-# ─── DATABASE ─────────────────────────────────────────────────
+async def init_db():
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.executescript("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            steam_id TEXT,
+            game TEXT DEFAULT 'cs2',
+            segment TEXT DEFAULT 'mid',
+            sub_tier TEXT DEFAULT 'freemium',
+            sub_until REAL DEFAULT 0,
+            searches_today INTEGER DEFAULT 0,
+            searches_reset_day INTEGER DEFAULT 0,
+            first_seen REAL DEFAULT 0,
+            referrer TEXT DEFAULT '',
+            trial_used INTEGER DEFAULT 0,
+            last_remind_day INTEGER DEFAULT 0,
+            created_at REAL DEFAULT 0
+        );
+        CREATE TABLE IF NOT EXISTS favorites (
+            user_id INTEGER,
+            market_hash TEXT,
+            added_price REAL,
+            added_at REAL,
+            strategy TEXT,
+            source TEXT,
+            PRIMARY KEY (user_id, market_hash)
+        );
+        CREATE TABLE IF NOT EXISTS deals_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            market_hash TEXT,
+            strategy TEXT,
+            buy_price REAL,
+            sell_price REAL,
+            profit_rub REAL,
+            profit_pct REAL,
+            float_value REAL,
+            sticker_count INTEGER,
+            sticker_value REAL,
+            blue_gem TEXT,
+            found_at REAL
+        );
+        CREATE TABLE IF NOT EXISTS referrals (
+            referrer_id INTEGER,
+            referred_id INTEGER,
+            rewarded INTEGER DEFAULT 0,
+            created_at REAL
+        );
+        CREATE TABLE IF NOT EXISTS stoploss_alerts (
+            user_id INTEGER,
+            market_hash TEXT,
+            last_alert REAL,
+            PRIMARY KEY (user_id, market_hash)
+        );
+        CREATE TABLE IF NOT EXISTS settings (
+            key TEXT PRIMARY KEY,
+            value TEXT
+        );
+        """)
+        await db.commit()
 
-def db_connect() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_FILE, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL")
-    conn.execute("PRAGMA busy_timeout=30000")
-    conn.row_factory = sqlite3.Row
-    return conn
+# ============================================================
+# КУРС ВАЛЮТ
+# ============================================================
 
+_currency_cache = {"usd": 0, "eur": 0, "ts": 0}
 
-def db_init():
-    conn = db_connect()
-    c = conn.cursor()
-    c.executescript("""
-    CREATE TABLE IF NOT EXISTS users (
-        user_id         INTEGER PRIMARY KEY,
-        steam_id        TEXT,
-        game            TEXT,
-        price_segment   TEXT,
-        notifications   INTEGER DEFAULT 1,
-        agreed          INTEGER DEFAULT 0,
-        tutorial_step   INTEGER DEFAULT 0,
-        setup_done      INTEGER DEFAULT 0,
-        trial_end       TEXT,
-        sub_end         TEXT,
-        referrer_id     INTEGER,
-        ref_bonus_count INTEGER DEFAULT 0,
-        ref_bonus_month TEXT,
-        created_at      TEXT,
-        last_active     TEXT,
-        is_deleted      INTEGER DEFAULT 0
-    );
-
-    CREATE TABLE IF NOT EXISTS favorites (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id     INTEGER,
-        item_name   TEXT,
-        item_price  REAL,
-        appid       INTEGER,
-        added_at    TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS bought_items (
-        id              INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id         INTEGER,
-        item_name       TEXT,
-        buy_price       REAL,
-        sell_target     REAL,
-        status          TEXT DEFAULT 'active',
-        bought_at       TEXT,
-        sold_at         TEXT,
-        sold_price      REAL
-    );
-
-    CREATE TABLE IF NOT EXISTS notified_items (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id     INTEGER,
-        item_name   TEXT,
-        notified_at TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS promocodes (
-        code        TEXT PRIMARY KEY,
-        days        INTEGER,
-        max_uses    INTEGER,
-        uses        INTEGER DEFAULT 0,
-        created_at  TEXT,
-        expires_at  TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS promo_redemptions (
-        id          INTEGER PRIMARY KEY AUTOINCREMENT,
-        user_id     INTEGER,
-        code        TEXT,
-        redeemed_at TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS payments (
-        charge_id   TEXT PRIMARY KEY,
-        user_id     INTEGER,
-        stars       INTEGER,
-        plan        TEXT,
-        paid_at     TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS deleted_users (
-        user_id     INTEGER PRIMARY KEY,
-        deleted_at  TEXT
-    );
-
-    CREATE TABLE IF NOT EXISTS rate_limit (
-        user_id     INTEGER,
-        window_start REAL
-    );
-    """)
-    conn.commit()
-    conn.close()
-
-
-def now_iso() -> str:
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def current_month() -> str:
-    return datetime.now().strftime("%Y-%m")
-
-
-# ─── RATE LIMITER ──────────────────────────────────────────────
-
-def rate_limit_check(user_id: int) -> bool:
-    """Возвращает True если запрос разрешён, False если превышен лимит."""
-    conn = db_connect()
-    c = conn.cursor()
+async def fetch_currency_rates():
     now = time.time()
-    window = now - 60  # последняя минута
-
-    c.execute("DELETE FROM rate_limit WHERE window_start < ?", (window,))
-    c.execute("SELECT COUNT(*) FROM rate_limit WHERE user_id = ?", (user_id,))
-    count = c.fetchone()[0]
-
-    if count >= RATE_LIMIT_PER_MIN:
-        conn.commit()
-        conn.close()
-        return False
-
-    c.execute("INSERT INTO rate_limit (user_id, window_start) VALUES (?, ?)", (user_id, now))
-    conn.commit()
-    conn.close()
-    return True
-
-
-# ─── USER HELPERS ──────────────────────────────────────────────
-
-def get_user(user_id: int) -> Optional[dict]:
-    conn = db_connect()
-    c = conn.cursor()
-    c.execute("SELECT * FROM users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return dict(row) if row else None
-
-
-def is_deleted(user_id: int) -> bool:
-    conn = db_connect()
-    c = conn.cursor()
-    c.execute("SELECT 1 FROM deleted_users WHERE user_id = ?", (user_id,))
-    row = c.fetchone()
-    conn.close()
-    return row is not None
-
-
-def create_user(user_id: int):
-    conn = db_connect()
-    c = conn.cursor()
-    c.execute("""
-        INSERT OR IGNORE INTO users (user_id, created_at, last_active, ref_bonus_month)
-        VALUES (?, ?, ?, ?)
-    """, (user_id, now_iso(), now_iso(), current_month()))
-    conn.commit()
-    conn.close()
-
-
-def update_user(user_id: int, **kwargs):
-    conn = db_connect()
-    c = conn.cursor()
-    sets = ", ".join(f"{k} = ?" for k in kwargs)
-    vals = list(kwargs.values()) + [user_id]
-    c.execute(f"UPDATE users SET {sets} WHERE user_id = ?", vals)
-    conn.commit()
-    conn.close()
-
-
-def check_sub_active(user: dict) -> bool:
-    """Возвращает True если триал или подписка активны."""
-    now = datetime.now()
-    trial_end = user.get("trial_end")
-    sub_end = user.get("sub_end")
-    if trial_end:
-        try:
-            t = datetime.strptime(trial_end, "%Y-%m-%d %H:%M:%S")
-            if now < t:
-                return True
-        except (ValueError, TypeError):
-            pass
-    if sub_end:
-        try:
-            s = datetime.strptime(sub_end, "%Y-%m-%d %H:%M:%S")
-            if now < s:
-                return True
-        except (ValueError, TypeError):
-            pass
-    return False
-
-
-def extend_trial(user_id: int, hours: int):
-    user = get_user(user_id)
-    if not user:
-        return
-    now = datetime.now()
-    current_end = None
-    if user.get("trial_end"):
-        try:
-            current_end = datetime.strptime(user["trial_end"], "%Y-%m-%d %H:%M:%S")
-        except (ValueError, TypeError):
-            pass
-    base = current_end if current_end and current_end > now else now
-    new_end = base + timedelta(hours=hours)
-    update_user(user_id, trial_end=new_end.strftime("%Y-%m-%d %H:%M:%S"))
-
-
-def extend_sub(user_id: int, days: int):
-    user = get_user(user_id)
-    if not user:
-        return
-    now = datetime.now()
-    current_end = None
-    if user.get("sub_end"):
-        try:
-            current_end = datetime.strptime(user["sub_end"], "%Y-%m-%d %H:%M:%S")
-        except (ValueError, TypeError):
-            pass
-    base = current_end if current_end and current_end > now else now
-    new_end = base + timedelta(days=days)
-    update_user(user_id, sub_end=new_end.strftime("%Y-%m-%d %H:%M:%S"))
-
-
-# ─── STEAM MARKET API ──────────────────────────────────────────
-
-_market_cache = {}  # key -> (timestamp, data)
-
-
-async def fetch_steam_market(appid: int, count: int = 50) -> list:
-    """Получает предметы с Steam Market через search/render endpoint."""
-    cache_key = f"market_{appid}"
-    now = time.time()
-    if cache_key in _market_cache:
-        ts, data = _market_cache[cache_key]
-        if now - ts < CACHE_TTL:
-            return data
-
-    url = "https://steamcommunity.com/market/search/render/"
-    params = {
-        "query": "",
-        "start": 0,
-        "count": count,
-        "search_descriptions": 0,
-        "sort_column": "price",
-        "sort_dir": "asc",
-        "appid": appid,
-        "norender": 1,
-        "currency": 5,
-        "country": "RU",
-    }
-    headers = {
-        "User-Agent": "Mozilla/5.0",
-        "Accept-Language": "ru-RU,ru;q=0.9",
-    }
-
+    if _currency_cache["ts"] and now - _currency_cache["ts"] < 3600:
+        return _currency_cache["usd"], _currency_cache["eur"]
     try:
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers, timeout=10) as resp:
-                if resp.status == 429:
-                    logger.warning("Steam rate limit (429), backing off")
-                    return []
-                if resp.status != 200:
-                    logger.warning(f"Steam returned {resp.status}")
-                    return []
-                data = await resp.json(content_type=None)
-
-        results = []
-        for item in data.get("results", []):
-            sell_price = item.get("sell_price", 0)
-            if sell_price == 0:
-                continue
-            name = item.get("hash_name", item.get("name", "Unknown"))
-            listings = item.get("sell_listings", 0)
-            asset = item.get("asset_description", {})
-            icon_url = asset.get("icon_url", "")
-            icon_url_large = asset.get("icon_url_large", "")
-            color = asset.get("name_color", "FFFFFF")
-
-            results.append({
-                "name": name,
-                "price": sell_price / 100,
-                "listings": listings,
-                "icon_url": icon_url,
-                "icon_url_large": icon_url_large,
-                "color": color,
-                "appid": appid,
-            })
-
-        _market_cache[cache_key] = (now, results)
-        return results
-
-    except asyncio.TimeoutError:
-        logger.warning("Steam API timeout")
-        return []
+            async with session.get("https://open.er-api.com/v6/latest/USD", timeout=10) as resp:
+                data = await resp.json()
+                usd = data.get("rates", {}).get("RUB", USD_RUB_FALLBACK)
+            async with session.get("https://open.er-api.com/v6/latest/EUR", timeout=10) as resp:
+                data = await resp.json()
+                eur = data.get("rates", {}).get("RUB", EUR_RUB_FALLBACK)
+        _currency_cache.update({"usd": usd, "eur": eur, "ts": now})
+        logger.info(f"Currency updated: USD={usd}, EUR={eur}")
+        return usd, eur
     except Exception as e:
-        logger.warning(f"Steam API error: {e}")
+        logger.warning(f"Currency fetch failed: {e}")
+        usd = _currency_cache["usd"] or USD_RUB_FALLBACK
+        eur = _currency_cache["eur"] or EUR_RUB_FALLBACK
+        return usd, eur
+
+def get_usd_rub():
+    return _currency_cache["usd"] or USD_RUB_FALLBACK
+
+def get_eur_rub():
+    return _currency_cache["eur"] or EUR_RUB_FALLBACK
+
+# ============================================================
+# ОЦЕНКА СТИКЕРОВ
+# ============================================================
+
+def evaluate_stickers(stickers_data, usd_rub):
+    if not stickers_data or not isinstance(stickers_data, list):
+        return {"count": 0, "total_value_rub": 0, "rare_flags": [], "has_rare": False, "detail": ""}
+    
+    total_value = 0
+    rare_flags = []
+    detail_parts = []
+    
+    for st in stickers_data:
+        name = st.get("name", "").lower()
+        wear = st.get("wear", 0)
+        
+        is_rare = False
+        for rare_key, rare_info in RARE_STICKERS.items():
+            if rare_key in name:
+                is_rare = True
+                rare_flags.append(rare_info["tag"])
+                wear_factor = max(0.1, 1.0 - wear) if wear else 1.0
+                st_value = rare_info["min_value"] * wear_factor
+                total_value += st_value
+                detail_parts.append(f"{rare_info['tag']} (~{int(st_value)}rub)")
+                break
+        
+        if not is_rare:
+            wear_factor = max(0.1, 1.0 - wear) if wear else 1.0
+            st_value = 100 * wear_factor
+            total_value += st_value
+    
+    overpay_value = total_value * 0.4
+    
+    return {
+        "count": len(stickers_data),
+        "total_value_rub": int(overpay_value),
+        "raw_value_rub": int(total_value),
+        "rare_flags": rare_flags,
+        "has_rare": len(rare_flags) > 0,
+        "detail": " | ".join(detail_parts) if detail_parts else ""
+    }
+
+# ============================================================
+# FLOAT-ПРЕМИУМ
+# ============================================================
+
+def calculate_float_premium(float_value, wear_name):
+    if not float_value or not wear_name:
+        return 0
+    
+    wear_lower, wear_upper = WEAR_RANGES.get(wear_name, (0, 1))
+    wear_range = wear_upper - wear_lower
+    if wear_range == 0:
+        return 0
+    
+    position = (float_value - wear_lower) / wear_range
+    
+    if position <= 0.05:
+        return 0.40
+    elif position <= 0.10:
+        return 0.25
+    elif position <= 0.20:
+        return 0.10
+    return 0
+
+# ============================================================
+# BLUE GEM ДЕТЕКЦИЯ
+# ============================================================
+
+def detect_blue_gem(paint_seed, item_name):
+    if not paint_seed:
+        return {"is_blue_gem": False, "tier": 0, "multiplier": 1.0, "tag": ""}
+    
+    name_lower = (item_name or "").lower()
+    seed = int(paint_seed)
+    
+    if "case hardened" not in name_lower:
+        return {"is_blue_gem": False, "tier": 0, "multiplier": 1.0, "tag": ""}
+    
+    if seed in BLUE_GEM_TIER1:
+        return {"is_blue_gem": True, "tier": 1, "multiplier": BLUE_GEM_TIERS["tier1"]["multiplier"],
+                "tag": BLUE_GEM_TIERS["tier1"]["tag"]}
+    
+    if seed in BLUE_GEM_TIER2:
+        return {"is_blue_gem": True, "tier": 2, "multiplier": BLUE_GEM_TIERS["tier2"]["multiplier"],
+                "tag": BLUE_GEM_TIERS["tier2"]["tag"]}
+    
+    if seed in BLUE_GEM_TIER3:
+        return {"is_blue_gem": True, "tier": 3, "multiplier": BLUE_GEM_TIERS["tier3"]["multiplier"],
+                "tag": BLUE_GEM_TIERS["tier3"]["tag"]}
+    
+    return {"is_blue_gem": False, "tier": 0, "multiplier": 1.0, "tag": ""}
+
+# ============================================================
+# РАСЧЁТ РЕАЛЬНОЙ СТОИМОСТИ
+# ============================================================
+
+def calculate_real_value(base_price_rub, float_value, wear_name, stickers_data, paint_seed, item_name, usd_rub):
+    sticker_info = evaluate_stickers(stickers_data, usd_rub)
+    float_premium_pct = calculate_float_premium(float_value, wear_name)
+    blue_gem_info = detect_blue_gem(paint_seed, item_name)
+    
+    float_bonus = base_price_rub * float_premium_pct
+    
+    blue_gem_bonus = 0
+    if blue_gem_info["is_blue_gem"]:
+        blue_gem_bonus = base_price_rub * (blue_gem_info["multiplier"] - 1.0)
+    
+    sticker_bonus = sticker_info["total_value_rub"]
+    
+    real_value = base_price_rub + float_bonus + blue_gem_bonus + sticker_bonus
+    
+    hidden_value = real_value - base_price_rub
+    hidden_pct = (hidden_value / base_price_rub * 100) if base_price_rub > 0 else 0
+    
+    return {
+        "real_value": int(real_value),
+        "base_price": int(base_price_rub),
+        "sticker_info": sticker_info,
+        "float_premium_pct": float_premium_pct,
+        "float_bonus": int(float_bonus),
+        "blue_gem_info": blue_gem_info,
+        "blue_gem_bonus": int(blue_gem_bonus),
+        "sticker_bonus": sticker_bonus,
+        "hidden_value": int(hidden_value),
+        "hidden_pct": round(hidden_pct, 1),
+        "has_hidden_value": hidden_value > base_price_rub * 0.15
+    }
+
+# ============================================================
+# ФОРМАТИРОВАНИЕ
+# ============================================================
+
+def fmt_price(rub):
+    if rub is None:
+        return "N/A"
+    if rub >= 1000000:
+        return f"{rub/1000000:.1f}M rub"
+    return f"{rub:.0f} rub"
+
+def fmt_pct(pct):
+    return f"{pct:.1f}%"
+
+def get_liquidity_emoji(volume):
+    if volume >= 10:
+        return "green"
+    elif volume >= 3:
+        return "yellow"
+    else:
+        return "red"
+
+def get_liquidity_text(volume):
+    if volume >= 10:
+        return f"High: {volume} sales/day"
+    elif volume >= 3:
+        return f"Mid: {volume} sales/day"
+    elif volume > 0:
+        return f"Low: {volume} sales/day"
+    return "No data"
+
+def strategy_name(strategy):
+    names = {
+        "csfloat_to_steam": "CSFloat -> Steam",
+        "skinport_to_steam": "Skinport -> Steam",
+        "steam_flip": "Steam flip",
+    }
+    return names.get(strategy, strategy)
+
+# ============================================================
+# API STEAM
+# ============================================================
+
+def parse_price_text(text):
+    if not text:
+        return 0
+    cleaned = re.sub(r"[^0-9.,]", "", str(text).replace(",", "."))
+    try:
+        return float(cleaned)
+    except:
+        return 0
+
+async def fetch_steam_search(game, start, count, session):
+    app_id = 730 if game == "cs2" else 570
+    url = "https://steamcommunity.com/market/search/render/"
+    params = {"appid": app_id, "norender": 1, "count": count, "start": start}
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with session.get(url, params=params, headers=headers, timeout=15) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            results = data.get("results", [])
+            items = []
+            for r in results:
+                name = r.get("hash_name", r.get("name", ""))
+                price = r.get("sell_price_text", "0")
+                price_num = parse_price_text(price)
+                listings = r.get("sell_listings", 0)
+                items.append({"name": name, "price": price_num, "listings": listings, "source": "steam"})
+            return items
+    except Exception as e:
+        logger.warning(f"Steam search error: {e}")
         return []
 
-
-async def fetch_steam_priceoverview(appid: int, market_hash_name: str) -> Optional[dict]:
-    """Получает текущую цену конкретного предмета."""
+async def fetch_steam_priceoverview(market_hash, session):
     url = "https://steamcommunity.com/market/priceoverview/"
-    params = {
-        "appid": appid,
-        "currency": 5,
-        "market_hash_name": market_hash_name,
-    }
-    headers = {"User-Agent": "Mozilla/5.0"}
-
+    params = {"appid": 730, "market_hash_name": market_hash}
     try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with session.get(url, params=params, headers=headers, timeout=10) as resp:
+            if resp.status != 200:
+                return None
+            data = await resp.json()
+            median = parse_price_text(data.get("median_price", "0"))
+            volume = 0
+            vol_str = data.get("volume", "0")
+            try:
+                volume = int(vol_str)
+            except:
+                volume = 0
+            return {"median": median, "volume": volume}
+    except:
+        return None
+
+# ============================================================
+# API CSFLOAT
+# ============================================================
+
+async def fetch_csfloat_listings(category, min_price, max_price, session):
+    url = "https://csfloat.com/api/v1/listings"
+    params = {"sort_by": "most_recent", "min_price": min_price, "max_price": max_price,
+              "category": category, "limit": 50}
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with session.get(url, params=params, headers=headers, timeout=15) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            items = []
+            for item in data:
+                item_data = item.get("item", {})
+                name = item_data.get("market_hash_name", "")
+                price_usd = item.get("price", 0) / 100
+                float_value = item_data.get("float_value", 0)
+                paint_seed = item_data.get("paint_seed", 0)
+                stickers = item_data.get("stickers", [])
+                wear_name = item_data.get("wear_name", "")
+                asset_id = item.get("id", "")
+                items.append({
+                    "name": name, "price_usd": price_usd,
+                    "price_rub": price_usd * get_usd_rub(),
+                    "float_value": float_value, "paint_seed": paint_seed,
+                    "stickers": stickers, "wear_name": wear_name,
+                    "asset_id": asset_id, "source": "csfloat",
+                    "url": f"https://csfloat.com/item/{asset_id}" if asset_id else "https://csfloat.com"
+                })
+            return items
+    except Exception as e:
+        logger.warning(f"CSFloat error: {e}")
+        return []
+
+# ============================================================
+# API SKINPORT
+# ============================================================
+
+async def fetch_skinport_items(session):
+    url = "https://skinport.com/api/v1/items"
+    params = {"app_id": 730, "currency": "RUB", "rows": 50, "order": "desc", "sort": "createdAt"}
+    try:
+        headers = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"}
+        async with session.get(url, params=params, headers=headers, timeout=15) as resp:
+            if resp.status != 200:
+                return []
+            data = await resp.json()
+            items = []
+            for item in data:
+                name = item.get("marketHashName", item.get("name", ""))
+                price = item.get("price", 0) or item.get("salePrice", 0)
+                suggested = item.get("suggestedPrice", 0) or price
+                items.append({
+                    "name": name, "price": price, "suggested": suggested,
+                    "source": "skinport",
+                    "url": f"https://skinport.com/item/{urllib.parse.quote(name)}" if name else "https://skinport.com"
+                })
+            return items
+    except Exception as e:
+        logger.warning(f"Skinport error: {e}")
+        return []
+
+# ============================================================
+# СКАНЕР РЫНКА
+# ============================================================
+
+_scan_cache = {}
+
+async def scan_market(segment, usd_rub):
+    async with SCAN_SEMAPHORE:
+        cache_key = f"{segment}_{int(usd_rub)}"
+        now = time.time()
+        if cache_key in _scan_cache and now - _scan_cache[cache_key]["ts"] < SCAN_CACHE_TTL:
+            return _scan_cache[cache_key]["data"]
+        
+        seg_ranges = {"low": (0, 500), "mid": (500, 2000), "high": (2000, 100000)}
+        min_rub, max_rub = seg_ranges.get(segment, (500, 2000))
+        min_usd = min_rub / usd_rub
+        max_usd = max_rub / usd_rub
+        
+        statuses = {}
+        all_deals = []
+        
         async with aiohttp.ClientSession() as session:
-            async with session.get(url, params=params, headers=headers, timeout=10) as resp:
-                if resp.status != 200:
-                    return None
-                data = await resp.json(content_type=None)
-
-        lowest = data.get("lowest_price", "")
-        median = data.get("median_price", "")
-        volume = data.get("volume", "0")
-
-        price = None
-        if lowest:
-            clean = re.sub(r"[^\d.]", "", lowest.replace(",", "."))
-            if clean:
-                price = float(clean)
-
-        return {"price": price, "volume": volume, "lowest_text": lowest}
-
-    except Exception:
-        return None
-
-
-def filter_by_segment(items: list, segment_key: str) -> list:
-    seg = SEGMENTS.get(segment_key)
-    if not seg:
-        return items
-    return [i for i in items if seg["min"] <= i["price"] < seg["max"]]
-
-
-# ─── ITEM IMAGE URL ────────────────────────────────────────────
-
-def get_item_image_url(item: dict) -> Optional[str]:
-    icon = item.get("icon_url_large") or item.get("icon_url")
-    if not icon:
-        return None
-    return f"https://steamcommunity-a.akamaihd.net/economy/image/{icon}/360fx360f"
-
-
-# ─── KEYBOARDS ────────────────────────────────────────────────
-
-def kb_main_menu() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("🔍 Найти предметы", callback_data="find_items")],
-        [InlineKeyboardButton("💼 Портфель", callback_data="portfolio"),
-         InlineKeyboardButton("⭐ Избранное", callback_data="favorites")],
-        [InlineKeyboardButton("📊 Статистика", callback_data="stats"),
-         InlineKeyboardButton("⚙️ Настройки", callback_data="settings")],
-        [InlineKeyboardButton("💳 Подписка", callback_data="subscription"),
-         InlineKeyboardButton("👥 Рефералка", callback_data="referral")],
-        [InlineKeyboardButton("❓ Помощь", callback_data="help")],
-    ])
-
-
-def kb_consent() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Согласен", callback_data="consent_yes")],
-        [InlineKeyboardButton("❌ Не согласен", callback_data="consent_no")],
-    ])
-
-
-def kb_tutorial(step: int) -> InlineKeyboardMarkup:
-    buttons = []
-    if step < 3:
-        buttons.append([InlineKeyboardButton("➡️ Далее", callback_data=f"tut_{step+1}")])
-    else:
-        buttons.append([InlineKeyboardButton("✅ Начать", callback_data="tut_done")])
-    buttons.append([InlineKeyboardButton("⏭ Пропустить", callback_data="tut_skip")])
-    return InlineKeyboardMarkup(buttons)
-
-
-def kb_games() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("CS2", callback_data="game_cs2")],
-        [InlineKeyboardButton("Dota 2", callback_data="game_dota2")],
-        [InlineKeyboardButton("Rust", callback_data="game_rust")],
-    ])
-
-
-def kb_segments() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("До 500 ₽", callback_data="seg_1")],
-        [InlineKeyboardButton("500–2 000 ₽", callback_data="seg_2")],
-        [InlineKeyboardButton("2 000–5 000 ₽", callback_data="seg_3")],
-        [InlineKeyboardButton("5 000 ₽+", callback_data="seg_4")],
-    ])
-
-
-def kb_subscription() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⭐ 7 дней — 150 Stars", callback_data="buy_sub_7")],
-        [InlineKeyboardButton("⭐ 30 дней — 500 Stars", callback_data="buy_sub_30")],
-        [InlineKeyboardButton("⭐ 90 дней — 1200 Stars", callback_data="buy_sub_90")],
-        [InlineKeyboardButton("🎁 Активировать промокод", callback_data="promo_enter")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_menu")],
-    ])
-
-
-def kb_back() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_menu")]
-    ])
-
-
-def kb_settings(user: dict) -> InlineKeyboardMarkup:
-    notif_text = "🔔 Уведомления: ВКЛ" if user.get("notifications") else "🔕 Уведомления: ВЫКЛ"
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton(f"🎮 Игра: {GAMES.get(user.get('game','cs2'),{}).get('name','CS2')}", callback_data="chg_game")],
-        [InlineKeyboardButton(f"💰 Сегмент: {SEGMENTS.get(user.get('price_segment','seg_1'),{}).get('label','До 500 ₽')}", callback_data="chg_seg")],
-        [InlineKeyboardButton(notif_text, callback_data="toggle_notif")],
-        [InlineKeyboardButton("🔗 Сменить Steam ID", callback_data="chg_steam")],
-        [InlineKeyboardButton("⬅️ Назад", callback_data="back_menu")],
-    ])
-
-
-def kb_item_actions(idx: int) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton("⭐ В избранное", callback_data=f"fav_{idx}"),
-            InlineKeyboardButton("💰 Купить", callback_data=f"buy_{idx}"),
-        ],
-        [InlineKeyboardButton("📄 Ещё предметы", callback_data="more_items")],
-    ])
-
-
-def kb_fav_actions(name: str) -> InlineKeyboardMarkup:
-    safe = name[:40]
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("💰 Купить", callback_data=f"favbuy_{safe}")],
-        [InlineKeyboardButton("🗑 Убрать", callback_data=f"unfav_{safe}")],
-    ])
-
-
-# ─── STEAM ID VALIDATION ──────────────────────────────────────
-
-def validate_steam_id(text: str) -> Optional[str]:
-    text = text.strip()
-    # Прямой SteamID64
-    if re.match(r"^\d{17}$", text):
-        return text
-    # Ссылка на профиль
-    m = re.search(r"steamcommunity\.com/profiles/(\d{17})", text)
-    if m:
-        return m.group(1)
-    # Короткая ссылка
-    if "steamcommunity.com/id/" in text:
-        return text  # сохраняем как есть, позже можно резолвить
-    return None
-
-
-# ─── HANDLERS: START & ONBOARDING ─────────────────────────────
-
-async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-
-    if not rate_limit_check(user_id):
-        await update.message.reply_text("⏳ Слишком много запросов. Подождите минуту.")
-        return
-
-    create_user(user_id)
-    user = get_user(user_id)
-
-    # Проверяем удалённых
-    if is_deleted(user_id):
-        await update.message.reply_text(
-            "Вы удалили свои данные. Обратитесь к администратору для восстановления."
-        )
-        return
-
-    # Рефералка
-    ref_id = None
-    if context.args:
-        arg = context.args[0]
-        if arg.startswith("ref"):
-            try:
-                ref_id = int(arg[3:])
-            except ValueError:
-                pass
-
-    # Защита от самореферала
-    if ref_id == user_id:
-        ref_id = None
-
-    # Проверяем, что реферер существует
-    if ref_id:
-        ref_user = get_user(ref_id)
-        if not ref_user:
-            ref_id = None
-
-    # Если юзер уже прошёл настройку
-    if user and user.get("setup_done"):
-        update_user(user_id, last_active=now_iso())
-        await show_main_menu(update, context, user_id)
-        return
-
-    # Сохраняем реферера (только для новых юзеров)
-    if ref_id and not user.get("referrer_id"):
-        update_user(user_id, referrer_id=ref_id)
-        # Уведомляем реферера
-        try:
-            await context.bot.send_message(
-                ref_id,
-                "👋 По вашей ссылке кто-то зашёл в бот!\n"
-                "Когда он завершит настройку и сделает первую покупку — вы получите +1 день."
+            steam_task = fetch_steam_search("cs2", 0, 100, session)
+            csfloat_task = fetch_csfloat_listings(0, min_usd * 100, max_usd * 100, session)
+            skinport_task = fetch_skinport_items(session)
+            
+            steam_items, csfloat_items, skinport_items = await asyncio.gather(
+                steam_task, csfloat_task, skinport_task, return_exceptions=True
             )
-        except Exception:
-            pass
-        # Показываем новичку
-        await update.message.reply_text(
-            "🎉 Вас пригласил друг!\n"
-            "После настройки вы получите +1 день к пробной версии.\n\n"
-        )
-    elif ref_id and user.get("referrer_id") == ref_id:
-        pass  # уже привязан
-
-    # Политика конфиденциальности
-    if not user.get("agreed"):
-        text = (
-            "👋 Добро пожаловать в EarnSkin!\n\n"
-            "Перед началом ознакомьтесь с политикой конфиденциальности:\n\n"
-            "📌 Мы храним: ваш Telegram ID, Steam ID, выбранные настройки.\n"
-            "📌 Мы НЕ храним: пароли, платёжные данные, личные переписки.\n"
-            "📌 Данные используются только для подбора предметов и работы бота.\n"
-            "📌 Вы можете удалить все данные командой /delete.\n\n"
-            "Согласны продолжить?"
-        )
-        await update.message.reply_text(text, reply_markup=kb_consent())
-        return
-
-    # Если согласился, но не прошёл туториал
-    if user.get("agreed") and not user.get("tutorial_step"):
-        await show_tutorial(update, context, 1)
-        return
-
-    # Если прошёл туториал, но не привязал Steam
-    if user.get("agreed") and user.get("tutorial_step") and not user.get("steam_id"):
-        await update.message.reply_text(
-            "🔗 Введите ваш Steam ID или ссылку на профиль Steam:\n"
-            "Например: 76561198000000000 или https://steamcommunity.com/profiles/76561198000000000"
-        )
-        return
-
-    await show_main_menu(update, context, user_id)
-
-
-async def show_main_menu(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    user = get_user(user_id)
-    if not user or not user.get("setup_done"):
-        await update.message.reply_text("Завершите настройку: /start")
-        return
-
-    sub_active = check_sub_active(user)
-    status = "✅ Активна" if sub_active else "❌ Истекла"
-
-    trial_end = user.get("trial_end")
-    sub_end = user.get("sub_end")
-    days_left = "—"
-    if sub_active:
-        end = sub_end or trial_end
-        if end:
-            try:
-                e = datetime.strptime(end, "%Y-%m-%d %H:%M:%S")
-                days_left = f"{(e - datetime.now()).days} дн."
-            except (ValueError, TypeError):
-                pass
-
-    game_name = GAMES.get(user.get("game", "cs2"), {}).get("name", "CS2")
-    seg_label = SEGMENTS.get(user.get("price_segment", "seg_1"), {}).get("label", "—")
-
-    text = (
-        f"🏠 Главное меню\n\n"
-        f"🎮 Игра: {game_name}\n"
-        f"💰 Сегмент: {seg_label}\n"
-        f"📅 Подписка: {status} ({days_left})\n\n"
-        f"Выберите действие:"
-    )
-    await update.message.reply_text(text, reply_markup=kb_main_menu())
-
-
-async def show_tutorial(update: Update, context: ContextTypes.DEFAULT_TYPE, step: int):
-    texts = {
-        1: (
-            "🎓 Туториал 1/3\n\n"
-            "EarnSkin — бот для арбитража скинов на Steam Market.\n\n"
-            "Как это работает:\n"
-            "1. Бот находит выгодные предметы в вашем ценовом сегменте\n"
-            "2. Вы покупаете их на Steam Market\n"
-            "3. Бот следит за ценой и подскажет, когда продать\n"
-            "4. Зарабатываете на разнице цен\n\n"
-            "Пример: купили за 500 ₽ → продали за 575 ₽ → ROI +15%"
-        ),
-        2: (
-            "🎓 Туториал 2/3\n\n"
-            "Команды бота:\n\n"
-            "🔍 Найти предметы — подборка выгодных скинов\n"
-            "💼 Портфель — ваши покупки + авто-продажа\n"
-            "⭐ Избранное — отложенные предметы\n"
-            "⚙️ Настройки — игра, сегмент, уведомления\n"
-            "💳 Подписка — продление через Telegram Stars\n"
-            "👥 Рефералка — +1 день за каждого друга\n\n"
-            "Также: /roi 100 150 — быстрый расчёт прибыли"
-        ),
-        3: (
-            "🎓 Туториал 3/3\n\n"
-            "Пробная версия: 24 часа (48ч по рефералке).\n"
-            "После истечения — подписка от 150 Stars/нед.\n\n"
-            "💡 Совет: включите уведомления, чтобы не пропустить "
-            "выгодные предметы. Они уходят за минуты!"
-        ),
-    }
-    update_user(update.effective_user.id, tutorial_step=step)
-    await update.message.reply_text(texts[step], reply_markup=kb_tutorial(step))
-
-
-# ─── HANDLERS: CALLBACKS ──────────────────────────────────────
-
-async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    data = query.data
-
-    if not rate_limit_check(user_id):
-        await query.message.reply_text("⏳ Слишком много запросов. Подождите минуту.")
-        return
-
-    user = get_user(user_id)
-    if not user:
-        create_user(user_id)
-        user = get_user(user_id)
-
-    # ─── Consent ───
-    if data == "consent_yes":
-        update_user(user_id, agreed=1)
-        await show_tutorial(update, context, 1)
-        return
-
-    if data == "consent_no":
-        await query.message.edit_text(
-            "Без согласия с политикой бот работать не может.\n"
-            "Вы можете удалить данные: /delete"
-        )
-        return
-
-    # ─── Tutorial ───
-    if data == "tut_skip":
-        update_user(user_id, tutorial_step=3, agreed=1)
-        await query.message.edit_text(
-            "🔗 Введите ваш Steam ID или ссылку на профиль Steam:\n"
-            "Например: 76561198000000000 или https://steamcommunity.com/profiles/76561198000000000"
-        )
-        return
-
-    if data.startswith("tut_"):
-        step = int(data.split("_")[1])
-        if step <= 3:
-            await show_tutorial(update, context, step)
-        elif data == "tut_done":
-            update_user(user_id, tutorial_step=3, agreed=1)
-            await query.message.edit_text(
-                "🔗 Введите ваш Steam ID или ссылку на профиль Steam:\n"
-                "Например: 76561198000000000 или https://steamcommunity.com/profiles/76561198000000000"
-            )
-        return
-
-    # ─── Game selection ───
-    if data.startswith("game_"):
-        game_key = data.split("_")[1]
-        if game_key in GAMES:
-            update_user(user_id, game=game_key)
-            if not user.get("setup_done"):
-                await query.message.edit_text(
-                    f"🎮 Игра: {GAMES[game_key]['name']}\n\n"
-                    "Выберите ценовой сегмент:",
-                    reply_markup=kb_segments()
-                )
+            
+            if isinstance(steam_items, Exception) or not steam_items:
+                statuses["steam"] = {"ok": False, "count": 0}
+                steam_items = []
             else:
-                await query.message.edit_text(
-                    f"✅ Игра изменена на {GAMES[game_key]['name']}",
-                    reply_markup=kb_back()
-                )
-        return
-
-    # ─── Segment selection ───
-    if data.startswith("seg_"):
-        seg_key = data
-        if seg_key in SEGMENTS:
-            update_user(user_id, price_segment=seg_key)
-
-            if not user.get("setup_done"):
-                # Завершение настройки
-                extend_trial(user_id, TRIAL_HOURS)
-
-                # Реферальный бонус новичку
-                if user.get("referrer_id"):
-                    extend_trial(user_id, REF_BONUS_HOURS)
-                    ref_id = user["referrer_id"]
-                    # Бонус рефереру (с лимитом по месяцам)
-                    ref_user = get_user(ref_id)
-                    if ref_user:
-                        ref_month = ref_user.get("ref_bonus_month") or current_month()
-                        ref_count = ref_user.get("ref_bonus_count", 0)
-                        if ref_month != current_month():
-                            ref_count = 0
-                            ref_month = current_month()
-                        if ref_count < REF_MAX_BONUS_PER_MONTH:
-                            extend_trial(ref_id, REF_BONUS_HOURS)
-                            update_user(ref_id,
-                                        ref_bonus_count=ref_count + 1,
-                                        ref_bonus_month=ref_month)
-                        try:
-                            await context.bot.send_message(
-                                ref_id,
-                                f"🎉 Ваш реферал завершил настройку!\n"
-                                f"Вам начислено +1 день.\n"
-                                f"Рефералов в этом месяце: {ref_count + 1}/{REF_MAX_BONUS_PER_MONTH}"
-                            )
-                        except Exception:
-                            pass
-
-                update_user(user_id, setup_done=1)
-
-                trial_hours = TRIAL_HOURS + (REF_BONUS_HOURS if user.get("referrer_id") else 0)
-                await query.message.edit_text(
-                    f"✅ Настройка завершена!\n\n"
-                    f"🎮 Игра: {GAMES[user.get('game','cs2')]['name']}\n"
-                    f"💰 Сегмент: {SEGMENTS[seg_key]['label']}\n"
-                    f"⏱ Пробная версия: {trial_hours} часов\n\n"
-                    f"Нажмите «Найти предметы», чтобы начать!",
-                    reply_markup=InlineKeyboardMarkup([
-                        [InlineKeyboardButton("🔍 Найти предметы", callback_data="find_items")],
-                    ])
-                )
+                statuses["steam"] = {"ok": True, "count": len(steam_items)}
+            
+            if isinstance(csfloat_items, Exception) or not csfloat_items:
+                statuses["csfloat"] = {"ok": False, "count": 0}
+                csfloat_items = []
             else:
-                await query.message.edit_text(
-                    f"✅ Сегмент изменён: {SEGMENTS[seg_key]['label']}",
-                    reply_markup=kb_back()
-                )
-        return
-
-    # ─── Main menu buttons ───
-    if data == "back_menu":
-        user = get_user(user_id)
-        sub_active = check_sub_active(user)
-        status = "✅ Активна" if sub_active else "❌ Истекла"
-        game_name = GAMES.get(user.get("game","cs2"),{}).get("name","CS2")
-        seg_label = SEGMENTS.get(user.get("price_segment","seg_1"),{}).get("label","—")
-        await query.message.edit_text(
-            f"🏠 Главное меню\n\n"
-            f"🎮 Игра: {game_name}\n"
-            f"💰 Сегмент: {seg_label}\n"
-            f"📅 Подписка: {status}\n\n"
-            f"Выберите действие:",
-            reply_markup=kb_main_menu()
-        )
-        return
-
-    if data == "find_items":
-        await handle_find_items(update, context, user_id)
-        return
-
-    if data == "more_items":
-        await handle_find_items(update, context, user_id, offset=context.user_data.get("item_offset", 0) + 5)
-        return
-
-    if data == "portfolio":
-        await handle_portfolio(update, context, user_id)
-        return
-
-    if data == "favorites":
-        await handle_favorites(update, context, user_id)
-        return
-
-    if data == "stats":
-        await handle_stats(update, context, user_id)
-        return
-
-    if data == "settings":
-        await handle_settings(update, context, user_id)
-        return
-
-    if data == "subscription":
-        await handle_subscription(update, context, user_id)
-        return
-
-    if data == "referral":
-        await handle_referral(update, context, user_id)
-        return
-
-    if data == "help":
-        text = (
-            "❓ Помощь\n\n"
-            "Команды:\n"
-            "/start — главное меню\n"
-            "/menu — главное меню\n"
-            "/roi 100 150 — расчёт прибыли\n"
-            "/promo КОД — промокод\n"
-            "/paysupport — помощь по оплате\n"
-            "/delete — удалить данные\n"
-            "/help — эта справка\n\n"
-            "Кнопки в меню:\n"
-            "🔍 Найти предметы — подборка скинов\n"
-            "💼 Портфель — покупки + авто-продажа\n"
-            "⭐ Избранное — отложенные предметы\n"
-            "⚙️ Настройки — игра, сегмент, уведомления\n"
-            "💳 Подписка — продление через Stars\n"
-            "👥 Рефералка — +1 день за друга"
-        )
-        await query.message.edit_text(text, reply_markup=kb_back())
-        return
-
-    # ─── Settings ───
-    if data == "chg_game":
-        await query.message.edit_text("Выберите игру:", reply_markup=kb_games())
-        return
-
-    if data == "chg_seg":
-        await query.message.edit_text("Выберите сегмент:", reply_markup=kb_segments())
-        return
-
-    if data == "chg_steam":
-        await query.message.edit_text(
-            "🔗 Введите новый Steam ID или ссылку:"
-        )
-        context.user_data["awaiting_steam"] = True
-        return
-
-    if data == "toggle_notif":
-        new_val = 0 if user.get("notifications") else 1
-        update_user(user_id, notifications=new_val)
-        user = get_user(user_id)
-        await query.message.edit_text(
-            "⚙️ Настройки",
-            reply_markup=kb_settings(user)
-        )
-        return
-
-    # ─── Favorites ───
-    if data.startswith("fav_"):
-        idx = int(data.split("_")[1])
-        items = context.user_data.get("last_items", [])
-        if idx < len(items):
-            item = items[idx]
-            conn = db_connect()
-            c = conn.cursor()
-            count = c.execute("SELECT COUNT(*) FROM favorites WHERE user_id=?", (user_id,)).fetchone()[0]
-            if count >= 50:
-                await query.message.reply_text("⭐ Избранное заполнено (максимум 50).")
-                conn.close()
-                return
-            c.execute("INSERT INTO favorites (user_id, item_name, item_price, appid, added_at) VALUES (?,?,?,?,?)",
-                      (user_id, item["name"], item["price"], item["appid"], now_iso()))
-            conn.commit()
-            conn.close()
-            await query.message.reply_text(f"⭐ Добавлено в избранное: {item['name']}")
-        return
-
-    if data.startswith("unfav_"):
-        name = data[6:]
-        conn = db_connect()
-        c = conn.cursor()
-        c.execute("DELETE FROM favorites WHERE user_id=? AND item_name=?", (user_id, name))
-        conn.commit()
-        conn.close()
-        await handle_favorites(update, context, user_id)
-        return
-
-    if data.startswith("favbuy_"):
-        name = data[7:]
-        conn = db_connect()
-        c = conn.cursor()
-        row = c.execute("SELECT item_price, appid FROM favorites WHERE user_id=? AND item_name=?", (user_id, name)).fetchone()
-        conn.close()
-        if row:
-            price = dict(row)["item_price"]
-            await _buy_item(update, context, user_id, name, price)
-        return
-
-    # ─── Buy ───
-    if data.startswith("buy_"):
-        idx = int(data.split("_")[1])
-        items = context.user_data.get("last_items", [])
-        if idx < len(items):
-            item = items[idx]
-            await _buy_item(update, context, user_id, item["name"], item["price"])
-        return
-
-    # ─── Subscription ───
-    if data == "promo_enter":
-        await query.message.reply_text("🎁 Введите промокод:")
-        context.user_data["awaiting_promo"] = True
-        return
-
-    if data.startswith("buy_sub_"):
-        plan_key = f"sub_{data.split('_')[2]}"
-        plan = SUB_PLANS.get(plan_key)
-        if not plan:
-            return
-        await _send_invoice(update, context, user_id, plan_key, plan)
-        return
-
-
-# ─── FIND ITEMS ───────────────────────────────────────────────
-
-async def handle_find_items(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, offset: int = 0):
-    user = get_user(user_id)
-    if not user or not user.get("setup_done"):
-        await update.callback_query.message.edit_text("Сначала завершите настройку: /start")
-        return
-
-    if not check_sub_active(user):
-        await update.callback_query.message.edit_text(
-            "❌ Подписка истекла. Оформите в разделе «💳 Подписка».",
-            reply_markup=kb_subscription()
-        )
-        return
-
-    game_key = user.get("game", "cs2")
-    seg_key = user.get("price_segment", "seg_1")
-    game = GAMES.get(game_key, GAMES["cs2"])
-
-    items = await fetch_steam_market(game["appid"], count=100)
-    items = filter_by_segment(items, seg_key)
-    items = sorted(items, key=lambda x: x["price"])
-
-    if not items:
-        await update.callback_query.message.edit_text(
-            "🔍 Предметы не найдены. Попробуйте другой сегмент в настройках.",
-            reply_markup=kb_back()
-        )
-        return
-
-    context.user_data["last_items"] = items
-    context.user_data["item_offset"] = offset
-
-    page = items[offset:offset+5]
-    text_parts = ["🔍 Найденные предметы:\n"]
-    for i, item in enumerate(page):
-        idx = offset + i
-        # Считаем потенциальный ROI (целевая +15%)
-        target = item["price"] * 1.15
-        roi = 15.0
-        text_parts.append(
-            f"{idx+1}. {item['name']}\n"
-            f"   💵 {item['price']:.2f} ₽ | 📦 {item['listings']} лист.\n"
-            f"   📈 Потенциал: +{roi:.0f}% → {target:.2f} ₽\n"
-        )
-
-    buttons = []
-    for i, item in enumerate(page):
-        idx = offset + i
-        buttons.append([
-            InlineKeyboardButton(f"⭐ {idx+1}", callback_data=f"fav_{idx}"),
-            InlineKeyboardButton(f"💰 {idx+1}", callback_data=f"buy_{idx}"),
-        ])
-
-    nav = []
-    if offset > 0:
-        nav.append(InlineKeyboardButton("⬅️ Назад", callback_data=f"page_{max(0, offset-5)}"))
-    if offset + 5 < len(items):
-        nav.append(InlineKeyboardButton("➡️ Ещё", callback_data="more_items"))
-    nav.append(InlineKeyboardButton("🏠 Меню", callback_data="back_menu"))
-    buttons.append(nav)
-
-    await update.callback_query.message.edit_text(
-        "\n".join(text_parts),
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-
-# ─── PORTFOLIO ────────────────────────────────────────────────
-
-async def handle_portfolio(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    conn = db_connect()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT * FROM bought_items WHERE user_id=? AND status='active' ORDER BY bought_at DESC",
-        (user_id,)
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        await update.callback_query.message.edit_text(
-            "💼 Портфель пуст.\n\nКупите предмет в разделе «Найти предметы».",
-            reply_markup=kb_back()
-        )
-        return
-
-    text_parts = ["💼 Ваш портфель:\n"]
-    for row in rows:
-        r = dict(row)
-        target = r["sell_target"]
-        text_parts.append(
-            f"📦 {r['item_name']}\n"
-            f"   Куплено: {r['buy_price']:.2f} ₽\n"
-            f"   Цель: {target:.2f} ₽ (+15%)\n"
-            f"   Ждём роста...\n"
-        )
-    text_parts.append("\n💡 Бот сам проверит цены и уведомит, когда пора продать.")
-    await update.callback_query.message.edit_text(
-        "\n".join(text_parts),
-        reply_markup=kb_back()
-    )
-
-
-# ─── FAVORITES ────────────────────────────────────────────────
-
-async def handle_favorites(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    conn = db_connect()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT * FROM favorites WHERE user_id=? ORDER BY added_at DESC",
-        (user_id,)
-    ).fetchall()
-    conn.close()
-
-    if not rows:
-        await update.callback_query.message.edit_text(
-            "⭐ Избранное пусто.\n\nДобавьте предметы из раздела «Найти предметы».",
-            reply_markup=kb_back()
-        )
-        return
-
-    text_parts = ["⭐ Избранное:\n"]
-    buttons = []
-    for row in rows:
-        r = dict(row)
-        text_parts.append(f"• {r['item_name']} — {r['item_price']:.2f} ₽\n")
-        safe = r["item_name"][:40]
-        buttons.append([
-            InlineKeyboardButton(f"💰 Купить: {r['item_name'][:20]}", callback_data=f"favbuy_{safe}"),
-            InlineKeyboardButton("🗑", callback_data=f"unfav_{safe}"),
-        ])
-    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="back_menu")])
-    await update.callback_query.message.edit_text(
-        "\n".join(text_parts),
-        reply_markup=InlineKeyboardMarkup(buttons)
-    )
-
-
-# ─── STATS ────────────────────────────────────────────────────
-
-async def handle_stats(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    user = get_user(user_id)
-    conn = db_connect()
-    c = conn.cursor()
-
-    bought = c.execute("SELECT COUNT(*) FROM bought_items WHERE user_id=?", (user_id,)).fetchone()[0]
-    sold = c.execute("SELECT COUNT(*) FROM bought_items WHERE user_id=? AND status='sold'", (user_id,)).fetchone()[0]
-    active = c.execute("SELECT COUNT(*) FROM bought_items WHERE user_id=? AND status='active'", (user_id,)).fetchone()[0]
-    favs = c.execute("SELECT COUNT(*) FROM favorites WHERE user_id=?", (user_id,)).fetchone()[0]
-
-    # Считаем реальную прибыль
-    sold_rows = c.execute(
-        "SELECT buy_price, sold_price FROM bought_items WHERE user_id=? AND status='sold'",
-        (user_id,)
-    ).fetchall()
-    total_profit = 0
-    total_roi = 0
-    for row in sold_rows:
-        r = dict(row)
-        bp = r["buy_price"] or 0
-        sp = r["sold_price"] or 0
-        profit = sp - bp
-        total_profit += profit
-        if bp > 0:
-            total_roi += (profit / bp) * 100
-
-    avg_roi = total_roi / len(sold_rows) if sold_rows else 0
-
-    # Всего юзеров
-    total_users = c.execute("SELECT COUNT(*) FROM users WHERE setup_done=1").fetchone()[0]
-
-    conn.close()
-
-    text = (
-        "📊 Статистика\n\n"
-        f"💼 Всего покупок: {bought}\n"
-        f"✅ Продано: {sold}\n"
-        f"⏳ Активных: {active}\n"
-        f"⭐ В избранном: {favs}\n"
-        f"💰 Общая прибыль: {total_profit:+.2f} ₽\n"
-        f"📈 Средний ROI: {avg_roi:.1f}%\n\n"
-        f"👥 Всего пользователей в боте: {total_users}"
-    )
-    await update.callback_query.message.edit_text(text, reply_markup=kb_back())
-
-
-# ─── SETTINGS ─────────────────────────────────────────────────
-
-async def handle_settings(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    user = get_user(user_id)
-    await update.callback_query.message.edit_text("⚙️ Настройки", reply_markup=kb_settings(user))
-
-
-# ─── SUBSCRIPTION ─────────────────────────────────────────────
-
-async def handle_subscription(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    user = get_user(user_id)
-    sub_active = check_sub_active(user)
-    status = "✅ Активна" if sub_active else "❌ Истекла"
-
-    end_date = user.get("sub_end") or user.get("trial_end") or "—"
-
-    text = (
-        f"💳 Подписка\n\n"
-        f"Статус: {status}\n"
-        f"Действует до: {end_date}\n\n"
-        f"Тарифы:\n"
-        f"⭐ 7 дней — 150 Stars\n"
-        f"⭐ 30 дней — 500 Stars\n"
-        f"⭐ 90 дней — 1200 Stars\n\n"
-        f"Оплата через Telegram Stars — нативно, без сторонних ссылок."
-    )
-    await update.callback_query.message.edit_text(text, reply_markup=kb_subscription())
-
-
-async def _send_invoice(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, plan_key: str, plan: dict):
-    await context.bot.send_invoice(
-        chat_id=user_id,
-        title=f"Подписка EarnSkin — {plan['label']}",
-        description=f"Доступ ко всем функциям бота на {plan['days']} дней",
-        payload=f"sub_{plan_key}",
-        provider_token="",
-        currency="XTR",
-        prices=[LabeledPrice(label=plan["label"], amount=plan["stars"])],
-        start_parameter="earnskin_sub",
-    )
-
-
-async def precheckout_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.pre_checkout_query.answer(ok=True)
-
-
-async def successful_payment_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    payment = update.message.successful_payment
-    user_id = update.effective_user.id
-    charge_id = payment.telegram_payment_charge_id
-    payload = payment.invoice_payload
-
-    # Защита от двойной оплаты
-    conn = db_connect()
-    c = conn.cursor()
-    existing = c.execute("SELECT 1 FROM payments WHERE charge_id=?", (charge_id,)).fetchone()
-    if existing:
-        conn.close()
-        return
-
-    c.execute(
-        "INSERT INTO payments (charge_id, user_id, stars, plan, paid_at) VALUES (?,?,?,?,?)",
-        (charge_id, user_id, payment.total_amount, payload, now_iso())
-    )
-    conn.commit()
-    conn.close()
-
-    plan_key = payload.replace("sub_", "")
-    plan = SUB_PLANS.get(plan_key, SUB_PLANS["sub_30"])
-    extend_sub(user_id, plan["days"])
-
-    await update.message.reply_text(
-        f"✅ Оплата прошла!\n"
-        f"Подписка продлена на {plan['days']} дней.\n"
-        f"Спасибо за поддержку! 🙏"
-    )
-
-
-# ─── REFERRAL ─────────────────────────────────────────────────
-
-async def handle_referral(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    user = get_user(user_id)
-    conn = db_connect()
-    c = conn.cursor()
-
-    total_refs = c.execute("SELECT COUNT(*) FROM users WHERE referrer_id=?", (user_id,)).fetchone()[0]
-    bonus_count = user.get("ref_bonus_count", 0)
-    conn.close()
-
-    link = f"https://t.me/{context.bot.username}?start=ref{user_id}"
-
-    text = (
-        "👥 Реферальная программа\n\n"
-        f"Ваша ссылка:\n{link}\n\n"
-        f"📊 Статистика:\n"
-        f"Всего приглашено: {total_refs}\n"
-        f"Бонусов получено: {bonus_count}/{REF_MAX_BONUS_PER_MONTH} в этом месяце\n\n"
-        f"💡 За каждого друга, который завершит настройку:\n"
-        f"   — Вы получаете +1 день\n"
-        f"   — Друг получает +1 день\n"
-        f"   — Лимит: {REF_MAX_BONUS_PER_MONTH} дней в месяц\n\n"
-        f"⚠️ Бонус начисляется после первой покупки реферала."
-    )
-    await update.callback_query.message.edit_text(text, reply_markup=kb_back())
-
-
-# ─── BUY ITEM ─────────────────────────────────────────────────
-
-async def _buy_item(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, name: str, price: float):
-    conn = db_connect()
-    c = conn.cursor()
-
-    count = c.execute("SELECT COUNT(*) FROM bought_items WHERE user_id=? AND status='active'", (user_id,)).fetchone()[0]
-    if count >= 20:
-        await query_message(update, "💼 Портфель заполнен (максимум 20). Сначала продайте что-нибудь.")
-        conn.close()
-        return
-
-    sell_target = price * 1.15
-    c.execute(
-        "INSERT INTO bought_items (user_id, item_name, buy_price, sell_target, status, bought_at) "
-        "VALUES (?,?,?,?, 'active', ?)",
-        (user_id, name, price, sell_target, now_iso())
-    )
-    conn.commit()
-    conn.close()
-
-    # Реферальный бонус после первой покупки
-    user = get_user(user_id)
-    if user and user.get("referrer_id"):
-        ref_id = user["referrer_id"]
-        ref_user = get_user(ref_id)
-        if ref_user:
-            ref_month = ref_user.get("ref_bonus_month") or current_month()
-            ref_count = ref_user.get("ref_bonus_count", 0)
-            if ref_month != current_month():
-                ref_count = 0
-                ref_month = current_month()
-            if ref_count < REF_MAX_BONUS_PER_MONTH:
-                extend_trial(ref_id, REF_BONUS_HOURS)
-                update_user(ref_id, ref_bonus_count=ref_count + 1, ref_bonus_month=ref_month)
-                try:
-                    await context.bot.send_message(
-                        ref_id,
-                        f"🎉 Ваш реферал совершил первую покупку!\n"
-                        f"Вам начислено +1 день.\n"
-                        f"Рефералов в этом месяце: {ref_count + 1}/{REF_MAX_BONUS_PER_MONTH}"
-                    )
-                except Exception:
-                    pass
-
-    await query_message(update, (
-        f"✅ Предмет добавлен в портфель!\n\n"
-        f"📦 {name}\n"
-        f"💵 Цена покупки: {price:.2f} ₽\n"
-        f"🎯 Целевая цена: {sell_target:.2f} ₽ (+15%)\n\n"
-        f"💡 Бот будет следить за ценой и уведомит, когда пора продавать."
-    ))
-
-
-async def query_message(update: Update, text: str):
-    """Отправляет сообщение в ответ на callback или message."""
-    if hasattr(update, "callback_query") and update.callback_query:
-        await update.callback_query.message.reply_text(text, reply_markup=kb_back())
-    else:
-        await update.message.reply_text(text, reply_markup=kb_back())
-
-
-# ─── TEXT HANDLER (Steam ID, Promo) ───────────────────────────
-
-async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    text = update.message.text.strip()
-
-    if not rate_limit_check(user_id):
-        await update.message.reply_text("⏳ Слишком много запросов. Подождите минуту.")
-        return
-
-    # Steam ID ввод
-    if context.user_data.get("awaiting_steam") or not get_user(user_id).get("steam_id"):
-        steam_id = validate_steam_id(text)
-        if not steam_id:
-            await update.message.reply_text(
-                "❌ Неверный формат. Введите Steam ID (17 цифр) или ссылку на профиль."
-            )
-            return
-
-        # Проверка дублей Steam ID
-        conn = db_connect()
-        c = conn.cursor()
-        existing = c.execute("SELECT 1 FROM users WHERE steam_id=? AND user_id!=?", (steam_id, user_id)).fetchone()
-        if existing:
-            conn.close()
-            await update.message.reply_text(
-                "❌ Этот Steam ID уже привязан к другому аккаунту."
-            )
-            return
-        conn.close()
-
-        context.user_data["awaiting_steam"] = False
-        update_user(user_id, steam_id=steam_id)
-
-        user = get_user(user_id)
-        if not user.get("game"):
-            await update.message.reply_text(
-                f"✅ Steam ID сохранён!\n\nВыберите игру:",
-                reply_markup=kb_games()
-            )
-        else:
-            await update.message.reply_text("✅ Steam ID обновлён!", reply_markup=kb_back())
-        return
-
-    # Промокод ввод
-    if context.user_data.get("awaiting_promo"):
-        context.user_data["awaiting_promo"] = False
-        await _redeem_promo(update, context, user_id, text)
-        return
-
-    # Fallback
-    await update.message.reply_text(
-        "Я не понимаю это сообщение. Используйте кнопки меню или команды.\n"
-        "/menu — главное меню\n/help — справка"
-    )
-
-
-async def _redeem_promo(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int, code: str):
-    conn = db_connect()
-    c = conn.cursor()
-    row = c.execute("SELECT * FROM promocodes WHERE code=?", (code,)).fetchone()
-    if not row:
-        conn.close()
-        await update.message.reply_text("❌ Промокод не найден.", reply_markup=kb_back())
-        return
-
-    promo = dict(row)
-    if promo["uses"] >= promo["max_uses"]:
-        conn.close()
-        await update.message.reply_text("❌ Промокод исчерпан.", reply_markup=kb_back())
-        return
-
-    if promo.get("expires_at"):
-        try:
-            exp = datetime.strptime(promo["expires_at"], "%Y-%m-%d %H:%M:%S")
-            if datetime.now() > exp:
-                conn.close()
-                await update.message.reply_text("❌ Промокод истёк.", reply_markup=kb_back())
-                return
-        except (ValueError, TypeError):
-            pass
-
-    already = c.execute("SELECT 1 FROM promo_redemptions WHERE user_id=? AND code=?", (user_id, code)).fetchone()
-    if already:
-        conn.close()
-        await update.message.reply_text("❌ Вы уже активировали этот промокод.", reply_markup=kb_back())
-        return
-
-    c.execute("UPDATE promocodes SET uses = uses + 1 WHERE code=?", (code,))
-    c.execute("INSERT INTO promo_redemptions (user_id, code, redeemed_at) VALUES (?,?,?)",
-              (user_id, code, now_iso()))
-    conn.commit()
-    conn.close()
-
-    extend_sub(user_id, promo["days"])
-    await update.message.reply_text(
-        f"✅ Промокод активирован!\nПодписка продлена на {promo['days']} дней.",
-        reply_markup=kb_back()
-    )
-
-
-# ─── COMMANDS ─────────────────────────────────────────────────
-
-async def cmd_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    create_user(user_id)
-    user = get_user(user_id)
-    if user and user.get("setup_done"):
-        await show_main_menu(update, context, user_id)
-    else:
-        await cmd_start(update, context)
-
-
-async def cmd_roi(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    args = context.args
-    if len(args) != 2:
-        await update.message.reply_text(
-            "Используйте: /roi <цена_покупки> <текущая_цена>\n"
-            "Пример: /roi 100 150"
-        )
-        return
-    try:
-        buy = float(args[0])
-        cur = float(args[1])
-    except ValueError:
-        await update.message.reply_text("Цены должны быть числами.")
-        return
-    profit = cur - buy
-    roi_pct = (profit / buy) * 100 if buy != 0 else 0
-    await update.message.reply_text(
-        f"💰 Расчёт ROI:\n"
-        f"Цена покупки: {buy:.2f} ₽\n"
-        f"Текущая цена: {cur:.2f} ₽\n"
-        f"Прибыль: {profit:+.2f} ₽\n"
-        f"ROI: {roi_pct:+.1f}%"
-    )
-
-
-async def cmd_promo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    if not context.args:
-        await update.message.reply_text("Используйте: /promo КОД")
-        return
-    await _redeem_promo(update, context, update.effective_user.id, context.args[0].upper())
-
-
-async def cmd_paysupport(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "💳 Поддержка по оплате\n\n"
-        "Если оплата не прошла или Stars списались, но подписка не продлилась:\n"
-        "1. Проверьте статус в /menu\n"
-        "2. Если проблема — напишите админу, указав дату и сумму.\n\n"
-        "Все платежи обрабатываются через Telegram Stars."
-    )
-
-
-async def cmd_delete(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    conn = db_connect()
-    c = conn.cursor()
-    c.execute("DELETE FROM favorites WHERE user_id=?", (user_id,))
-    c.execute("DELETE FROM bought_items WHERE user_id=?", (user_id,))
-    c.execute("DELETE FROM notified_items WHERE user_id=?", (user_id,))
-    c.execute("DELETE FROM promo_redemptions WHERE user_id=?", (user_id,))
-    c.execute("DELETE FROM users WHERE user_id=?", (user_id,))
-    c.execute("INSERT OR REPLACE INTO deleted_users (user_id, deleted_at) VALUES (?, ?)", (user_id, now_iso()))
-    conn.commit()
-    conn.close()
-    await update.message.reply_text(
-        "🗑 Все ваши данные удалены.\n"
-        "Вы больше не получите уведомления.\n"
-        "Для повторной регистрации обратитесь к администратору."
-    )
-
-
-async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "❓ Помощь\n\n"
-        "/start — начать / главное меню\n"
-        "/menu — главное меню\n"
-        "/roi 100 150 — расчёт прибыли\n"
-        "/promo КОД — промокод\n"
-        "/paysupport — помощь по оплате\n"
-        "/delete — удалить данные\n"
-        "/help — эта справка"
-    )
-
-
-# ─── ADMIN ───────────────────────────────────────────────────
-
-async def cmd_admin(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        await update.message.reply_text("У вас нет доступа к админ-панели.")
-        return
-
-    conn = db_connect()
-    c = conn.cursor()
-    total = c.execute("SELECT COUNT(*) FROM users WHERE setup_done=1").fetchone()[0]
-    active = 0
-    rows = c.execute("SELECT trial_end, sub_end FROM users WHERE setup_done=1").fetchall()
-    for row in rows:
-        r = dict(row)
-        u = {"trial_end": r["trial_end"], "sub_end": r["sub_end"]}
-        if check_sub_active(u):
-            active += 1
-
-    paid = c.execute("SELECT COUNT(*) FROM payments").fetchone()[0]
-    stars = c.execute("SELECT COALESCE(SUM(stars),0) FROM payments").fetchone()[0]
-    favs = c.execute("SELECT COUNT(*) FROM favorites").fetchone()[0]
-    bought = c.execute("SELECT COUNT(*) FROM bought_items").fetchone()[0]
-    refs = c.execute("SELECT COUNT(*) FROM users WHERE referrer_id IS NOT NULL").fetchone()[0]
-    conn.close()
-
-    text = (
-        "🔧 Админ-панель\n\n"
-        f"👥 Всего юзеров: {total}\n"
-        f"✅ Активных: {active}\n"
-        f"💳 Платежей: {paid}\n"
-        f"⭐ Получено Stars: {stars}\n"
-        f"💼 Всего покупок: {bought}\n"
-        f"⭐ Избранного: {favs}\n"
-        f"👥 Рефералов: {refs}\n\n"
-        "Команды:\n"
-        "/broadcast текст — рассылка\n"
-        "/addpromo КОД ДНИ ЛИМИТ — промокод\n"
-        "/listpromo — список промокодов"
-    )
-    await update.message.reply_text(text)
-
-
-async def cmd_broadcast(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        return
-    if not context.args:
-        await update.message.reply_text("Используйте: /broadcast текст")
-        return
-
-    text = "📢 " + " ".join(context.args)
-    conn = db_connect()
-    c = conn.cursor()
-    rows = c.execute("SELECT user_id FROM users WHERE setup_done=1").fetchall()
-    conn.close()
-
-    sent = 0
-    failed = 0
-    for row in rows:
-        uid = dict(row)["user_id"]
-        try:
-            await context.bot.send_message(uid, text)
-            sent += 1
-            await asyncio.sleep(0.5)
-        except Exception:
-            failed += 1
-
-    await update.message.reply_text(f"✅ Отправлено: {sent}, ошибок: {failed}")
-
-
-async def cmd_addpromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        return
-    if len(context.args) != 3:
-        await update.message.reply_text("Используйте: /addpromo КОД ДНИ ЛИМИТ")
-        return
-    code, days, limit = context.args[0].upper(), int(context.args[1]), int(context.args[2])
-    conn = db_connect()
-    c = conn.cursor()
-    expires = (datetime.now() + timedelta(days=30)).strftime("%Y-%m-%d %H:%M:%S")
-    c.execute(
-        "INSERT OR REPLACE INTO promocodes (code, days, max_uses, uses, created_at, expires_at) "
-        "VALUES (?,?,?,0,?,?)",
-        (code, days, limit, now_iso(), expires)
-    )
-    conn.commit()
-    conn.close()
-    await update.message.reply_text(f"✅ Промокод {code}: {days} дней, лимит {limit}.")
-
-
-async def cmd_listpromo(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
-    if user_id not in ADMIN_IDS:
-        return
-    conn = db_connect()
-    c = conn.cursor()
-    rows = c.execute("SELECT * FROM promocodes").fetchall()
-    conn.close()
-    if not rows:
-        await update.message.reply_text("Промокодов нет.")
-        return
-    text = "📋 Промокоды:\n\n"
-    for row in rows:
-        r = dict(row)
-        text += f"• {r['code']} — {r['days']} дн., {r['uses']}/{r['max_uses']}\n"
-    await update.message.reply_text(text)
-
-
-# ─── BACKGROUND JOBS ──────────────────────────────────────────
-
-async def job_new_items_check(context: ContextTypes.DEFAULT_TYPE):
-    """Каждые 2 минуты — проверка новых предметов для юзеров с включёнными уведомлениями."""
-    conn = db_connect()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT user_id, game, price_segment FROM users WHERE setup_done=1 AND notifications=1"
-    ).fetchall()
-    conn.close()
-
-    for row in rows:
-        r = dict(row)
-        user_id = r["user_id"]
-        user = get_user(user_id)
-        if not user or not check_sub_active(user):
-            continue
-
-        game_key = r.get("game", "cs2")
-        seg_key = r.get("price_segment", "seg_1")
-        game = GAMES.get(game_key, GAMES["cs2"])
-
-        items = await fetch_steam_market(game["appid"], count=30)
-        items = filter_by_segment(items, seg_key)
-        if not items:
-            continue
-
-        # Берём первый предмет, не отправленный за 24 часа
-        for item in items:
-            item_name = item["name"]
-            conn = db_connect()
-            c = conn.cursor()
-            recent = c.execute(
-                "SELECT 1 FROM notified_items WHERE user_id=? AND item_name=? AND "
-                "notified_at > datetime('now','-1 day')",
-                (user_id, item_name)
-            ).fetchone()
-            if not recent:
-                # Проверяем, не в избранном и не в портфеле
-                in_fav = c.execute("SELECT 1 FROM favorites WHERE user_id=? AND item_name=?", (user_id, item_name)).fetchone()
-                in_bought = c.execute("SELECT 1 FROM bought_items WHERE user_id=? AND item_name=? AND status='active'", (user_id, item_name)).fetchone()
-                if in_fav or in_bought:
-                    conn.close()
+                statuses["csfloat"] = {"ok": True, "count": len(csfloat_items)}
+            
+            if isinstance(skinport_items, Exception) or not skinport_items:
+                statuses["skinport"] = {"ok": False, "count": 0}
+                skinport_items = []
+            else:
+                statuses["skinport"] = {"ok": True, "count": len(skinport_items)}
+            
+            steam_prices = {}
+            for item in steam_items:
+                if min_rub <= item["price"] <= max_rub:
+                    steam_prices[item["name"]] = item["price"]
+            
+            steam_overview = {}
+            names_to_check = list(steam_prices.keys())[:30]
+            for name in names_to_check:
+                ov = await fetch_steam_priceoverview(name, session)
+                if ov:
+                    steam_overview[name] = ov
+                await asyncio.sleep(3)
+            
+            # CSFloat deals with sniper analysis
+            for cf_item in csfloat_items:
+                name = cf_item["name"]
+                buy_price = cf_item["price_rub"]
+                if buy_price < min_rub or buy_price > max_rub:
                     continue
-                c.execute("INSERT INTO notified_items (user_id, item_name, notified_at) VALUES (?,?,?)",
-                          (user_id, item_name, now_iso()))
-                conn.commit()
-                conn.close()
-
-                target = item["price"] * 1.15
-                text = (
-                    f"🔔 Новый выгодный предмет!\n\n"
-                    f"📦 {item_name}\n"
-                    f"💵 Цена: {item['price']:.2f} ₽\n"
-                    f"📦 Листингов: {item['listings']}\n"
-                    f"📈 Потенциал: +15% → {target:.2f} ₽\n\n"
-                    f"⚡ Быстрее за покупкой — пока предмет доступен!"
+                
+                real_val = calculate_real_value(
+                    buy_price, cf_item.get("float_value"),
+                    cf_item.get("wear_name"), cf_item.get("stickers"),
+                    cf_item.get("paint_seed"), name, usd_rub
                 )
-                try:
-                    await context.bot.send_message(user_id, text)
-                except Exception:
-                    pass
-                break
-            conn.close()
+                
+                sell_steam_median = steam_overview.get(name, {}).get("median", 0)
+                sell_price = max(sell_steam_median, real_val["real_value"]) if sell_steam_median > 0 else real_val["real_value"]
+                
+                if real_val["has_hidden_value"]:
+                    sell_price = real_val["real_value"]
+                
+                if sell_price <= 0 or buy_price <= 0:
+                    continue
+                
+                commission = sell_price * STEAM_COMMISSION
+                net = sell_price - commission
+                profit = net - buy_price
+                roi = profit / buy_price if buy_price > 0 else 0
+                volume = steam_overview.get(name, {}).get("volume", 0)
+                
+                if roi >= MIN_ROI_THRESHOLD or real_val["has_hidden_value"]:
+                    all_deals.append({
+                        "name": name, "buy_price": buy_price, "sell_price": sell_price,
+                        "base_sell": sell_steam_median, "commission": commission,
+                        "net": net, "profit": profit, "roi": roi,
+                        "strategy": "csfloat_to_steam", "strategy_icon": "rocket",
+                        "source": "csfloat",
+                        "url": cf_item.get("url", "https://csfloat.com"),
+                        "float_value": cf_item.get("float_value"),
+                        "wear_name": cf_item.get("wear_name"),
+                        "paint_seed": cf_item.get("paint_seed"),
+                        "stickers": cf_item.get("stickers"),
+                        "volume": volume, "real_value": real_val,
+                    })
+            
+            # Skinport deals
+            for sp_item in skinport_items:
+                name = sp_item["name"]
+                buy_price = sp_item["price"]
+                if buy_price < min_rub or buy_price > max_rub:
+                    continue
+                sell_steam_median = steam_overview.get(name, {}).get("median", 0)
+                if sell_steam_median <= 0:
+                    continue
+                commission = sell_steam_median * STEAM_COMMISSION
+                net = sell_steam_median - commission
+                profit = net - buy_price
+                roi = profit / buy_price if buy_price > 0 else 0
+                volume = steam_overview.get(name, {}).get("volume", 0)
+                if roi >= MIN_ROI_THRESHOLD:
+                    all_deals.append({
+                        "name": name, "buy_price": buy_price, "sell_price": sell_steam_median,
+                        "base_sell": sell_steam_median, "commission": commission,
+                        "net": net, "profit": profit, "roi": roi,
+                        "strategy": "skinport_to_steam", "strategy_icon": "package",
+                        "source": "skinport",
+                        "url": sp_item.get("url", "https://skinport.com"),
+                        "float_value": None, "wear_name": "", "paint_seed": None,
+                        "stickers": [], "volume": volume, "real_value": None,
+                    })
+            
+            # Steam flip
+            for name, buy_price in steam_prices.items():
+                if buy_price < min_rub or buy_price > max_rub:
+                    continue
+                ov = steam_overview.get(name, {})
+                median = ov.get("median", 0)
+                volume = ov.get("volume", 0)
+                if median <= 0 or buy_price <= 0:
+                    continue
+                commission = median * STEAM_COMMISSION
+                net = median - commission
+                profit = net - buy_price
+                roi = profit / buy_price if buy_price > 0 else 0
+                if roi >= MIN_ROI_THRESHOLD:
+                    all_deals.append({
+                        "name": name, "buy_price": buy_price, "sell_price": median,
+                        "base_sell": median, "commission": commission,
+                        "net": net, "profit": profit, "roi": roi,
+                        "strategy": "steam_flip", "strategy_icon": "rotate",
+                        "source": "steam",
+                        "url": f"https://steamcommunity.com/market/listings/730/{urllib.parse.quote(name)}",
+                        "float_value": None, "wear_name": "", "paint_seed": None,
+                        "stickers": [], "volume": volume, "real_value": None,
+                    })
+        
+        all_deals.sort(key=lambda d: (
+            -1 if d.get("real_value") and d["real_value"]["has_hidden_value"] else 0,
+            d["roi"]
+        ), reverse=True)
+        
+        result = {"deals": all_deals[:20], "statuses": statuses}
+        _scan_cache[cache_key] = {"data": result, "ts": now}
+        return result
 
-        await asyncio.sleep(0.5)
+# ============================================================
+# ФОРМАТИРОВАНИЕ ПРЕДМЕТА
+# ============================================================
 
+def format_deal(deal, index, usd_rub):
+    lines = []
+    lines.append(f"\n**{index}. {deal['name']}**\n")
+    lines.append(f"Strategy: {deal['strategy_icon']} {strategy_name(deal['strategy'])}")
+    lines.append(f"Buy ({deal['source']}): {fmt_price(deal['buy_price'])}")
+    lines.append(f"Sell (Steam): {fmt_price(deal['sell_price'])}")
+    lines.append(f"Commission (15%): -{fmt_price(deal['commission'])}")
+    lines.append(f"Net: {fmt_price(deal['net'])}")
+    profit_emoji = "+" if deal['profit'] > 0 else "-"
+    lines.append(f"Profit: {profit_emoji}{fmt_price(deal['profit'])} ({fmt_pct(deal['roi'] * 100)})")
+    lines.append(f"Liquidity: {get_liquidity_text(deal.get('volume', 0))}")
+    
+    if deal.get("float_value") is not None:
+        float_str = f"{deal['float_value']:.4f}"
+        wear = deal.get("wear_name", "")
+        lines.append(f"Float: {float_str} ({wear})")
+    
+    rv = deal.get("real_value")
+    if rv and rv["sticker_info"]["count"] > 0:
+        st_info = rv["sticker_info"]
+        lines.append(f"Stickers: {st_info['count']}")
+        if st_info["has_rare"]:
+            lines.append(f"RARE: {', '.join(st_info['rare_flags'])}")
+        if st_info["detail"]:
+            lines.append(f"  {st_info['detail']}")
+    
+    if rv and rv["blue_gem_info"]["is_blue_gem"]:
+        bg = rv["blue_gem_info"]
+        lines.append(f"{bg['tag']} (seed: {deal.get('paint_seed', '?')})")
+    
+    if rv and rv["float_premium_pct"] > 0:
+        lines.append(f"Float premium: +{fmt_pct(rv['float_premium_pct'] * 100)}")
+    
+    if rv and rv["has_hidden_value"]:
+        lines.append(f"\nHIDDEN VALUE: +{fmt_price(rv['hidden_value'])} ({fmt_pct(rv['hidden_pct'])})")
+        lines.append(f"Real value: {fmt_price(rv['real_value'])}")
+    
+    lines.append(f"\nTrade ban: 7 days. Price may change.")
+    
+    lines.append(f"\nDeal check:")
+    lines.append(f"ROI: {fmt_pct(deal['roi'] * 100)} (threshold 15%)")
+    lines.append(f"Commission: Steam 15% included")
+    liq = get_liquidity_emoji(deal.get("volume", 0))
+    lines.append(f"Liquidity: {liq}")
+    if deal.get("float_value") is not None:
+        lines.append(f"Float: {deal['float_value']:.4f}")
+    if rv and rv["sticker_info"]["has_rare"]:
+        lines.append(f"Rare stickers: {', '.join(rv['sticker_info']['rare_flags'])}")
+    if rv and rv["blue_gem_info"]["is_blue_gem"]:
+        lines.append(f"Blue Gem: {rv['blue_gem_info']['tag']}")
+    lines.append(f"Trade ban: 7 days")
+    status = "PROFITABLE" if deal['roi'] >= MIN_ROI_THRESHOLD else "CAUTION"
+    lines.append(f"\nStatus: {status}")
+    
+    return "\n".join(lines)
 
-async def job_auto_sell_check(context: ContextTypes.DEFAULT_TYPE):
-    """Каждый час — проверка цен купленных предметов."""
-    conn = db_connect()
-    c = conn.cursor()
-    rows = c.execute(
-        "SELECT id, user_id, item_name, buy_price, sell_target, appid "
-        "FROM bought_items WHERE status='active'"
-    ).fetchall()
-    conn.close()
+# ============================================================
+# ПОЛЬЗОВАТЕЛЬСКИЕ ФУНКЦИИ
+# ============================================================
 
-    for row in rows:
-        r = dict(row)
-        user_id = r["user_id"]
-        user = get_user(user_id)
-        if not user or not check_sub_active(user):
-            continue
+async def get_user(user_id):
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM users WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+            if not row:
+                now = time.time()
+                await db.execute(
+                    "INSERT INTO users (user_id, first_seen, created_at) VALUES (?, ?, ?)",
+                    (user_id, now, now))
+                await db.commit()
+                return {"user_id": user_id, "steam_id": None, "game": "cs2",
+                        "segment": "mid", "sub_tier": "freemium", "sub_until": 0,
+                        "searches_today": 0, "searches_reset_day": 0, "first_seen": now,
+                        "referrer": "", "trial_used": 0, "last_remind_day": 0, "created_at": now}
+            return dict(row)
 
-        game_key = user.get("game", "cs2")
-        game = GAMES.get(game_key, GAMES["cs2"])
+async def update_user(user_id, **kwargs):
+    cols = ", ".join(f"{k} = ?" for k in kwargs)
+    vals = list(kwargs.values()) + [user_id]
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(f"UPDATE users SET {cols} WHERE user_id = ?", vals)
+        await db.commit()
 
-        price_data = await fetch_steam_priceoverview(game["appid"], r["item_name"])
-        if not price_data or price_data.get("price") is None:
-            continue
+async def is_subscribed(user_id):
+    user = await get_user(user_id)
+    now = time.time()
+    if user["sub_tier"] in ("start", "pro", "max") and user["sub_until"] > now:
+        return True, user["sub_tier"]
+    return False, user.get("sub_tier", "freemium")
 
-        current_price = price_data["price"]
-        if current_price >= r["sell_target"]:
-            profit = current_price - r["buy_price"]
-            roi_pct = (profit / r["buy_price"]) * 100 if r["buy_price"] > 0 else 0
+async def check_freemium_limit(user_id):
+    user = await get_user(user_id)
+    today = datetime.now().day
+    if user["searches_reset_day"] != today:
+        await update_user(user_id, searches_today=0, searches_reset_day=today)
+        user["searches_today"] = 0
+    if user["sub_tier"] in ("start", "pro", "max") and user["sub_until"] > time.time():
+        return True, -1
+    if user["searches_today"] < FREEMIUM_DAILY_LIMIT:
+        return True, FREEMIUM_DAILY_LIMIT - user["searches_today"] - 1
+    return False, 0
 
-            conn = db_connect()
-            c = conn.cursor()
-            c.execute(
-                "UPDATE bought_items SET status='sold', sold_at=?, sold_price=? WHERE id=?",
-                (now_iso(), current_price, r["id"])
-            )
-            conn.commit()
-            conn.close()
+async def increment_searches(user_id):
+    user = await get_user(user_id)
+    today = datetime.now().day
+    if user["searches_reset_day"] != today:
+        await update_user(user_id, searches_today=1, searches_reset_day=today)
+    else:
+        await update_user(user_id, searches_today=user["searches_today"] + 1)
 
-            try:
-                await context.bot.send_message(
-                    user_id,
-                    f"✅ Время продавать!\n\n"
-                    f"📦 {r['item_name']}\n"
-                    f"💵 Куплено: {r['buy_price']:.2f} ₽\n"
-                    f"💵 Текущая цена: {current_price:.2f} ₽\n"
-                    f"💰 Прибыль: {profit:+.2f} ₽\n"
-                    f"📈 ROI: {roi_pct:+.1f}%\n\n"
-                    f"🎯 Целевая цена достигнута — фиксируйте прибыль!"
-                )
-            except Exception:
-                pass
+async def save_deal_to_history(user_id, deal):
+    async with aiosqlite.connect(DB_PATH) as db:
+        rv = deal.get("real_value")
+        await db.execute(
+            """INSERT INTO deals_history
+            (user_id, market_hash, strategy, buy_price, sell_price, profit_rub, profit_pct,
+             float_value, sticker_count, sticker_value, blue_gem, found_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, deal["name"], deal["strategy"], deal["buy_price"], deal["sell_price"],
+             deal["profit"], deal["roi"] * 100,
+             deal.get("float_value"),
+             rv["sticker_info"]["count"] if rv else 0,
+             rv["sticker_info"]["total_value_rub"] if rv else 0,
+             rv["blue_gem_info"]["tag"] if rv and rv["blue_gem_info"]["is_blue_gem"] else "",
+             time.time()))
+        await db.commit()
 
-        await asyncio.sleep(1)
+# ============================================================
+# КЛАВИАТУРЫ
+# ============================================================
 
+def main_menu_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Search", callback_data="search")
+    kb.button(text="Favorites", callback_data="favorites")
+    kb.button(text="Subscribe", callback_data="subscribe")
+    kb.button(text="Stats", callback_data="stats")
+    kb.button(text="Referral", callback_data="referral")
+    kb.button(text="Settings", callback_data="settings")
+    kb.adjust(2, 2, 2)
+    return kb.as_markup()
 
-# ─── GRACEFUL SHUTDOWN ────────────────────────────────────────
+def segment_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Under 500", callback_data="seg_low")
+    kb.button(text="500-2k", callback_data="seg_mid")
+    kb.button(text="2k+", callback_data="seg_high")
+    kb.button(text="Back", callback_data="menu")
+    kb.adjust(3, 1)
+    return kb.as_markup()
 
-def setup_signal_handlers(app):
-    def handler(signum, frame):
-        logger.info(f"Signal {signum} received, shutting down...")
+def subscribe_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Start - 99 stars/wk", callback_data="pay_start_week")
+    kb.button(text="Pro - 199 stars/wk", callback_data="pay_pro_week")
+    kb.button(text="Pro - 599 stars/mo", callback_data="pay_pro_month")
+    kb.button(text="Max - 399 stars/mo", callback_data="pay_max_month")
+    kb.button(text="Max - 999 stars/3mo", callback_data="pay_max_3month")
+    kb.button(text="Back", callback_data="menu")
+    kb.adjust(1, 1, 1, 1, 1, 1)
+    return kb.as_markup()
+
+def deal_kb(deal):
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"Buy on {deal['source'].capitalize()}", url=deal["url"])
+    kb.button(text="Add to favorites", callback_data=f"fav_{deal['name'][:40]}")
+    kb.button(text="Back", callback_data="search")
+    kb.adjust(1, 1, 1)
+    return kb.as_markup()
+
+def back_kb():
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Back", callback_data="menu")
+    return kb.as_markup()
+
+# ============================================================
+# ХЕНДЛЕРЫ
+# ============================================================
+
+@router.message(CommandStart())
+async def cmd_start(message: Message):
+    user_id = message.from_user.id
+    user = await get_user(user_id)
+    
+    ref = message.text.split("_")[-1] if "_" in message.text and len(message.text.split("_")) > 1 else ""
+    if ref and ref != str(user_id) and not user.get("referrer"):
+        await update_user(user_id, referrer=ref)
         try:
-            conn = db_connect()
-            conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
-            conn.close()
-        except Exception:
+            ref_id = int(ref)
+            async with aiosqlite.connect(DB_PATH) as db:
+                await db.execute(
+                    "INSERT OR IGNORE INTO referrals (referrer_id, referred_id, created_at) VALUES (?, ?, ?)",
+                    (ref_id, user_id, time.time()))
+                await db.commit()
+        except:
             pass
+    
+    text = (
+        "EarnSkin v6.0 - Arbitrage Scanner + Sniper\n\n"
+        "Finds deals across Steam, CSFloat, Skinport.\n"
+        "Evaluates stickers, float, Blue Gem patterns.\n\n"
+        "Real example:\n"
+        "AK-47 | Asiimov (FT)\n"
+        "CSFloat -> Steam\n"
+        "Buy: 1058 rub -> Sell: 1850 rub\n"
+        "Net: +514 rub (48.6%)\n\n"
+        "Hidden value example:\n"
+        "AK-47 | Case Hardened with 4x Katowice 2014\n"
+        "Base: 1800 rub -> Real: ~13800 rub\n"
+        "Stickers add +12000 rub!\n\n"
+        "Freemium: 3 searches/day free\n"
+        "Deal of the day: free for everyone\n"
+        "Guarantee: no deals in a week -> next week free\n\n"
+        "Press Agree to continue."
+    )
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Agree", callback_data="agree")
+    kb.button(text="Policy", callback_data="policy")
+    kb.adjust(1, 1)
+    await message.answer(text, reply_markup=kb.as_markup())
 
-    signal.signal(signal.SIGTERM, handler)
-    signal.signal(signal.SIGINT, handler)
+@router.callback_query(F.data == "agree")
+async def cb_agree(callback: CallbackQuery):
+    await callback.message.edit_text(
+        "Which game are you trading?",
+        reply_markup=InlineKeyboardBuilder()
+        .button(text="CS2", callback_data="game_cs2")
+        .button(text="Dota 2", callback_data="game_dota")
+        .adjust(2)
+        .as_markup())
+    await callback.answer()
 
+@router.callback_query(F.data.startswith("game_"))
+async def cb_game(callback: CallbackQuery):
+    game = callback.data.split("_")[1]
+    await update_user(callback.from_user.id, game=game)
+    await callback.message.edit_text("Select budget segment:", reply_markup=segment_kb())
+    await callback.answer()
 
-# ─── MAIN ────────────────────────────────────────────────────
+@router.callback_query(F.data.startswith("seg_"))
+async def cb_segment(callback: CallbackQuery):
+    seg = callback.data.split("_")[1]
+    await update_user(callback.from_user.id, segment=seg)
+    await show_segment_search(callback)
 
-def main():
-    db_init()
-    logger.info("EarnSkin bot starting...")
+async def show_segment_search(callback):
+    await callback.message.edit_text(
+        "Search items\n\nSelect segment or press Search:",
+        reply_markup=InlineKeyboardBuilder()
+        .button(text="Under 500", callback_data="seg_low")
+        .button(text="500-2k", callback_data="seg_mid")
+        .button(text="2k+", callback_data="seg_high")
+        .button(text="Search", callback_data="do_search")
+        .button(text="Menu", callback_data="menu")
+        .adjust(3, 1, 1)
+        .as_markup())
 
-    app = ApplicationBuilder().token(BOT_TOKEN).build()
+@router.callback_query(F.data == "search")
+async def cb_search(callback: CallbackQuery):
+    await show_segment_search(callback)
 
-    # Handlers
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("menu", cmd_menu))
-    app.add_handler(CommandHandler("roi", cmd_roi))
-    app.add_handler(CommandHandler("promo", cmd_promo))
-    app.add_handler(CommandHandler("paysupport", cmd_paysupport))
-    app.add_handler(CommandHandler("delete", cmd_delete))
-    app.add_handler(CommandHandler("help", cmd_help))
-    app.add_handler(CommandHandler("admin", cmd_admin))
-    app.add_handler(CommandHandler("broadcast", cmd_broadcast))
-    app.add_handler(CommandHandler("addpromo", cmd_addpromo))
-    app.add_handler(CommandHandler("listpromo", cmd_listpromo))
+@router.callback_query(F.data == "do_search")
+async def cb_do_search(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    user = await get_user(user_id)
+    
+    can_search, remaining = await check_freemium_limit(user_id)
+    if not can_search:
+        await callback.message.edit_text(
+            "Free search limit reached (3/day)\n\n"
+            "Subscribe for unlimited search:\n"
+            "Start - 99 stars/wk\n"
+            "Pro - 199 stars/wk\n"
+            "Max - 399 stars/mo",
+            reply_markup=subscribe_kb())
+        await callback.answer()
+        return
+    
+    await increment_searches(user_id)
+    segment = user.get("segment", "mid")
+    usd_rub = get_usd_rub()
+    eur_rub = get_eur_rub()
+    
+    await callback.message.edit_text(
+        f"Scanning 3 platforms...\n"
+        f"Rate: 1$ = {usd_rub:.1f} rub | 1e = {eur_rub:.1f} rub\n"
+        f"Segment: {segment}\n"
+        f"Checking stickers, float, Blue Gem...")
+    await callback.answer()
+    
+    result = await scan_market(segment, usd_rub)
+    deals = result.get("deals", [])
+    statuses = result.get("statuses", {})
+    
+    if not deals:
+        status_lines = []
+        for src, st in statuses.items():
+            icon = "OK" if st["ok"] else "FAIL"
+            name = {"steam": "Steam", "csfloat": "CSFloat", "skinport": "Skinport"}.get(src, src)
+            status_lines.append(f"[{icon}] {name} - {st['count']} items")
+        status_text = "\n".join(status_lines)
+        await callback.message.edit_text(
+            f"No items with ROI 15%+ right now\n\n"
+            f"Platform status:\n{status_text}\n\n"
+            f"Bot is monitoring. Try another segment or check later.",
+            reply_markup=segment_kb())
+        return
+    
+    for deal in deals:
+        await save_deal_to_history(user_id, deal)
+    
+    text_parts = [f"Found {len(deals)} deals! Top 5:\n"]
+    text_parts.append(f"Rate: 1$ = {usd_rub:.1f} rub\n")
+    
+    hidden_count = sum(1 for d in deals if d.get("real_value") and d["real_value"]["has_hidden_value"])
+    if hidden_count:
+        text_parts.append(f"{hidden_count} with hidden value (stickers/float/Blue Gem)\n")
+    
+    for i, deal in enumerate(deals[:5], 1):
+        text_parts.append(format_deal(deal, i, usd_rub))
+        text_parts.append("")
+    
+    full_text = "\n".join(text_parts)
+    
+    kb = InlineKeyboardBuilder()
+    if deals:
+        kb.button(text=f"Buy on {deals[0]['source'].capitalize()}", url=deals[0]["url"])
+        kb.button(text="Add to favorites", callback_data=f"fav_{deals[0]['name'][:40]}")
+    kb.button(text="Search more", callback_data="do_search")
+    kb.button(text="Menu", callback_data="menu")
+    kb.adjust(1, 1, 1, 1)
+    
+    if len(full_text) > 4000:
+        full_text = full_text[:3900] + "\n... (first 5 shown)"
+    
+    await callback.message.edit_text(full_text, reply_markup=kb.as_markup())
 
-    app.add_handler(CallbackQueryHandler(callback_handler))
-    app.add_handler(PreCheckoutQueryHandler(precheckout_handler))
-    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, successful_payment_handler))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
+@router.callback_query(F.data == "menu")
+async def cb_menu(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    sub, tier = await is_subscribed(user_id)
+    tier_emoji = {"freemium": "FREE", "start": "START", "pro": "PRO", "max": "MAX"}.get(tier, "FREE")
+    text = f"Menu\n\nStatus: [{tier_emoji}]"
+    if sub:
+        user = await get_user(user_id)
+        until = datetime.fromtimestamp(user["sub_until"]).strftime("%d.%m %H:%M")
+        text += f" until {until}"
+    await callback.message.edit_text(text, reply_markup=main_menu_kb())
+    await callback.answer()
 
-    # Jobs
-    job_queue = app.job_queue
-    if job_queue:
-        job_queue.run_repeating(job_new_items_check, interval=MARKET_CHECK_INTERVAL, first=30)
-        job_queue.run_repeating(job_auto_sell_check, interval=PRICE_CHECK_INTERVAL, first=60)
+@router.callback_query(F.data == "subscribe")
+async def cb_subscribe(callback: CallbackQuery):
+    text = (
+        "Subscription\n\n"
+        "Start - 99 stars/wk\n"
+        "Unlimited search, 1 segment, 5 favorites\n\n"
+        "Pro - 199 stars/wk | 599 stars/mo (-25%)\n"
+        "Unlimited + alerts + 3 segments + stop-loss\n\n"
+        "Max - 399 stars/mo | 999 stars/3mo (-30%)\n"
+        "All + unlimited favorites + priority + history\n\n"
+        "Guarantee: no deals ROI 15%+ in a week -> next week free"
+    )
+    await callback.message.edit_text(text, reply_markup=subscribe_kb())
+    await callback.answer()
 
-    # Signals
-    setup_signal_handlers(app)
+@router.callback_query(F.data.startswith("pay_"))
+async def cb_pay(callback: CallbackQuery):
+    parts = callback.data.split("_")
+    tier = parts[1]
+    period = parts[2] if len(parts) > 2 else "week"
+    prices = {
+        ("start", "week"): 99, ("pro", "week"): 199, ("pro", "month"): 599,
+        ("max", "month"): 399, ("max", "3month"): 999,
+    }
+    stars = prices.get((tier, period), 199)
+    period_days = {"week": 7, "month": 30, "3month": 90}.get(period, 7)
+    try:
+        await callback.message.answer_invoice(
+            title=f"EarnSkin {tier.upper()} ({period})",
+            description=f"Subscription {tier} for {period_days} days",
+            payload=f"sub_{tier}_{period}",
+            prices=[LabeledPrice(label="Stars", amount=stars)],
+            provider_token="", currency="XTR")
+    except Exception as e:
+        await callback.message.answer(f"Payment error: {e}")
+    await callback.answer()
 
-    logger.info("EarnSkin bot started!")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+@router.message(F.successful_payment)
+async def on_payment(message: Message):
+    payload = message.successful_payment.invoice_payload
+    parts = payload.split("_")
+    tier = parts[1] if len(parts) > 1 else "pro"
+    period = parts[2] if len(parts) > 2 else "week"
+    period_days = {"week": 7, "month": 30, "3month": 90}.get(period, 7)
+    until = time.time() + period_days * 86400
+    await update_user(message.from_user.id, sub_tier=tier, sub_until=until)
+    await message.answer(
+        f"Subscription activated!\nTier: {tier.upper()}\n"
+        f"Valid until: {datetime.fromtimestamp(until).strftime('%d.%m.%Y %H:%M')}\n\n"
+        f"Unlimited search is now available!")
 
+@router.callback_query(F.data == "favorites")
+async def cb_favorites(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM favorites WHERE user_id = ?", (user_id,)) as cur:
+            rows = await cur.fetchall()
+    if not rows:
+        await callback.message.edit_text(
+            "Favorites empty. Add items from search.", reply_markup=back_kb())
+        await callback.answer()
+        return
+    text = "Favorites:\n\n"
+    for i, row in enumerate(rows, 1):
+        text += f"{i}. {row['market_hash']}\n"
+        text += f"   Added at: {fmt_price(row['added_price'])}\n"
+        text += f"   {row['strategy']}\n\n"
+    await callback.message.edit_text(text, reply_markup=back_kb())
+    await callback.answer()
+
+@router.callback_query(F.data.startswith("fav_"))
+async def cb_add_fav(callback: CallbackQuery):
+    name = callback.data[4:]
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "INSERT OR IGNORE INTO favorites (user_id, market_hash, added_price, added_at, strategy, source) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (user_id, name, 0, time.time(), "manual", "manual"))
+        await db.commit()
+    await callback.answer("Added to favorites!")
+
+@router.callback_query(F.data == "stats")
+async def cb_stats(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT COUNT(*) as cnt, AVG(profit_pct) as avg_roi, SUM(profit_rub) as total_profit "
+            "FROM deals_history WHERE user_id = ?", (user_id,)) as cur:
+            row = await cur.fetchone()
+        async with db.execute(
+            "SELECT COUNT(*) as hidden FROM deals_history WHERE user_id = ? AND blue_gem != ''",
+            (user_id,)) as cur:
+            bg = await cur.fetchone()
+        async with db.execute(
+            "SELECT COUNT(*) as sticker FROM deals_history WHERE user_id = ? AND sticker_value > 0",
+            (user_id,)) as cur:
+            st = await cur.fetchone()
+    avg_roi = row['avg_roi'] if row and row['avg_roi'] else 0
+    text = (
+        f"Statistics\n\n"
+        f"Total finds: {row['cnt'] if row else 0}\n"
+        f"Average ROI: {avg_roi:.1f}%\n"
+        f"Potential profit: {fmt_price(row['total_profit'] if row else 0)}\n\n"
+        f"Blue Gem finds: {bg['hidden'] if bg else 0}\n"
+        f"Sticker finds: {st['sticker'] if st else 0}\n\n"
+        f"Subscription pays off with one deal!")
+    await callback.message.edit_text(text, reply_markup=back_kb())
+    await callback.answer()
+
+@router.callback_query(F.data == "referral")
+async def cb_referral(callback: CallbackQuery):
+    user_id = callback.from_user.id
+    bot_info = await bot.get_me()
+    ref_link = f"https://t.me/{bot_info.username}?start={user_id}"
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT COUNT(*) as cnt FROM referrals WHERE referrer_id = ?", (user_id,)) as cur:
+            r = await cur.fetchone()
+        async with db.execute(
+            "SELECT COUNT(*) as rewarded FROM referrals WHERE referrer_id = ? AND rewarded = 1",
+            (user_id,)) as cur:
+            rw = await cur.fetchone()
+    text = (
+        f"Referral Program\n\n"
+        f"Invited: {r['cnt'] if r else 0}\n"
+        f"Bonuses received: {rw['rewarded'] if rw else 0}\n\n"
+        f"Your link:\n{ref_link}\n\n"
+        f"Each paying friend = +1 week subscription!")
+    await callback.message.edit_text(text, reply_markup=back_kb())
+    await callback.answer()
+
+@router.callback_query(F.data == "settings")
+async def cb_settings(callback: CallbackQuery):
+    user = await get_user(callback.from_user.id)
+    text = (
+        f"Settings\n\n"
+        f"Game: {user['game']}\n"
+        f"Segment: {user['segment']}\n"
+        f"Subscription: {user['sub_tier']}\n"
+        f"Steam ID: {user['steam_id'] or 'not set'}")
+    kb = InlineKeyboardBuilder()
+    kb.button(text="Change game", callback_data="game_cs2")
+    kb.button(text="Change segment", callback_data="search")
+    kb.button(text="Menu", callback_data="menu")
+    kb.adjust(1, 1, 1)
+    await callback.message.edit_text(text, reply_markup=kb.as_markup())
+    await callback.answer()
+
+@router.callback_query(F.data == "policy")
+async def cb_policy(callback: CallbackQuery):
+    text = (
+        "Privacy Policy\n\n"
+        "1. Bot does not request passwords or payment data.\n"
+        "2. Payment via Telegram Stars.\n"
+        "3. Steam ID used only for identification.\n"
+        "4. Bot does not store purchase data.\n"
+        "5. You can delete data with /delete.\n"
+        "6. Bot does not guarantee profit - all trades at your risk.")
+    await callback.message.edit_text(text, reply_markup=back_kb())
+    await callback.answer()
+
+# ============================================================
+# СДЕЛА ДНЯ
+# ============================================================
+
+async def send_deal_of_the_day():
+    usd_rub = get_usd_rub()
+    best_deal = None
+    for seg in ["low", "mid", "high"]:
+        result = await scan_market(seg, usd_rub)
+        deals = result.get("deals", [])
+        if deals:
+            hidden = [d for d in deals if d.get("real_value") and d["real_value"]["has_hidden_value"]]
+            if hidden:
+                best_deal = hidden[0]
+                break
+            if not best_deal or deals[0]["roi"] > best_deal["roi"]:
+                best_deal = deals[0]
+    
+    if not best_deal:
+        logger.info("Deal of the day: market empty")
+        return
+    
+    is_below = best_deal["roi"] < MIN_ROI_THRESHOLD
+    header = "DEAL OF THE DAY (free)\n\n" if not is_below else              "Best deal today (ROI below 15% threshold)\n\n"
+    
+    text = header + format_deal(best_deal, 1, usd_rub)
+    text += "\n\nWant more? Subscribe -> /subscribe"
+    
+    kb = InlineKeyboardBuilder()
+    kb.button(text=f"Buy on {best_deal['source'].capitalize()}", url=best_deal["url"])
+    kb.button(text="Subscribe", callback_data="subscribe")
+    kb.adjust(1, 1)
+    
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT user_id FROM users") as cur:
+            users = await cur.fetchall()
+    
+    sent = 0
+    for u in users:
+        try:
+            await bot.send_message(u["user_id"], text, reply_markup=kb.as_markup())
+            sent += 1
+            await asyncio.sleep(0.05)
+        except:
+            pass
+    logger.info(f"Deal of the day sent to {sent} users")
+
+# ============================================================
+# СТОП-ЛОСС
+# ============================================================
+
+async def check_stoploss():
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute("SELECT * FROM favorites") as cur:
+            favs = await cur.fetchall()
+    if not favs:
+        return
+    async with aiohttp.ClientSession() as session:
+        for fav in favs:
+            ov = await fetch_steam_priceoverview(fav["market_hash"], session)
+            if not ov:
+                continue
+            current = ov["median"]
+            added = fav["added_price"]
+            if added <= 0:
+                continue
+            drop = (current - added) / added
+            if drop <= -STOPLoss_THRESHOLD:
+                async with aiosqlite.connect(DB_PATH) as db:
+                    async with db.execute(
+                        "SELECT last_alert FROM stoploss_alerts WHERE user_id = ? AND market_hash = ?",
+                        (fav["user_id"], fav["market_hash"])) as cur:
+                        row = await cur.fetchone()
+                    if row and time.time() - row[0] < 3600:
+                        continue
+                    await db.execute(
+                        "INSERT OR REPLACE INTO stoploss_alerts (user_id, market_hash, last_alert) VALUES (?, ?, ?)",
+                        (fav["user_id"], fav["market_hash"], time.time()))
+                    await db.commit()
+                drop_pct = abs(drop * 100)
+                text = (
+                    f"STOP-LOSS TRIGGERED!\n\n"
+                    f"Item: {fav['market_hash']}\n"
+                    f"Added at: {fmt_price(added)}\n"
+                    f"Current: {fmt_price(current)}\n"
+                    f"Drop: -{drop_pct:.1f}%\n\n"
+                    f"Recommend selling before price drops further.\n"
+                    f"Steam: https://steamcommunity.com/market/listings/730/{urllib.parse.quote(fav['market_hash'])}")
+                try:
+                    await bot.send_message(fav["user_id"], text)
+                except:
+                    pass
+            await asyncio.sleep(3)
+
+# ============================================================
+# FREEMIUM НАПОМИНАНИЕ
+# ============================================================
+
+async def check_freemium_remind():
+    now = time.time()
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        async with db.execute(
+            "SELECT * FROM users WHERE sub_tier = 'freemium' AND first_seen > 0") as cur:
+            users = await cur.fetchall()
+        for user in users:
+            days_active = (now - user["first_seen"]) / 86400
+            if days_active >= FREEMIUM_REMIND_DAY and user["last_remind_day"] == 0:
+                async with db.execute(
+                    "SELECT COUNT(*) as cnt FROM deals_history WHERE user_id = ?",
+                    (user["user_id"],)) as cur:
+                    r = await cur.fetchone()
+                text = (
+                    f"You used {user['searches_today'] * 4} free searches.\n"
+                    f"Bot found {r['cnt'] if r else 0} deals.\n\n"
+                    f"Subscribe to not miss the next ones:\n"
+                    f"Start - 99 stars/wk (unlimited)\n"
+                    f"Pro - 199 stars/wk (+ alerts + stop-loss)")
+                try:
+                    kb = InlineKeyboardBuilder()
+                    kb.button(text="Subscribe", callback_data="subscribe")
+                    await bot.send_message(user["user_id"], text, reply_markup=kb.as_markup())
+                    await update_user(user["user_id"], last_remind_day=1)
+                except:
+                    pass
+
+# ============================================================
+# ФОНОВЫЕ ЗАДАЧИ
+# ============================================================
+
+async def background_tasks():
+    await asyncio.sleep(10)
+    while True:
+        now = datetime.now()
+        hour = now.hour
+        if now.minute == 0:
+            await fetch_currency_rates()
+        if hour == DEAL_OF_THE_DAY_HOUR and now.minute < 5:
+            await send_deal_of_the_day()
+            await asyncio.sleep(300)
+        if now.minute % 30 == 0 and now.second < 10:
+            await check_stoploss()
+            await asyncio.sleep(60)
+        if now.minute == 15:
+            await check_freemium_remind()
+            await asyncio.sleep(60)
+        await asyncio.sleep(30)
+
+# ============================================================
+# ЗАПУСК
+# ============================================================
+
+async def main():
+    await init_db()
+    await fetch_currency_rates()
+    asyncio.create_task(background_tasks())
+    logger.info("EarnSkin v6.0 Sniper Edition started")
+    await dp.start_polling(bot)
 
 if __name__ == "__main__":
-    main()
+    asyncio.run(main())
